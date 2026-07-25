@@ -23,7 +23,7 @@
  */
 
 export interface Continuation {
-	/** The request that produced `responseId`, minus input, for field comparison. */
+	/** The full-input request that produced `responseId`, for field comparison. */
 	requestBody: Record<string, unknown>;
 	responseId: string;
 	/** Items the server produced, in the shape the next request's input will use. */
@@ -37,6 +37,8 @@ export interface Continuation {
 }
 
 export interface PooledSocket {
+	/** Pool bucket this socket belongs to, so releasing it needs no second argument. */
+	key: string;
 	socket: WebSocket;
 	/** Wall clock at handshake, for the connection age cap. */
 	openedAt: number;
@@ -79,7 +81,7 @@ export class SocketPool {
 
 	/** Registers a freshly opened socket, already marked busy. */
 	add(key: string, socket: WebSocket, now = Date.now()): PooledSocket {
-		const entry: PooledSocket = { socket, openedAt: now, lastUsedAt: now, busy: true };
+		const entry: PooledSocket = { key, socket, openedAt: now, lastUsedAt: now, busy: true };
 		const bucket = this.entries.get(key);
 		if (bucket) bucket.push(entry);
 		else this.entries.set(key, [entry]);
@@ -87,17 +89,17 @@ export class SocketPool {
 	}
 
 	/** Returns a socket to the pool, or discards it. */
-	release(key: string, entry: PooledSocket, keep: boolean, now = Date.now()): void {
+	release(entry: PooledSocket, keep: boolean, now = Date.now()): void {
 		entry.busy = false;
 		entry.lastUsedAt = now;
 		if (keep && !isUnusable(entry, now)) return;
 
 		closeQuietly(entry.socket);
-		const bucket = this.entries.get(key);
+		const bucket = this.entries.get(entry.key);
 		if (!bucket) return;
 		const index = bucket.indexOf(entry);
 		if (index >= 0) bucket.splice(index, 1);
-		if (bucket.length === 0) this.entries.delete(key);
+		if (bucket.length === 0) this.entries.delete(entry.key);
 	}
 
 	closeAll(): void {
@@ -122,11 +124,12 @@ function isUnusable(entry: PooledSocket, now: number): boolean {
 	);
 }
 
-function closeQuietly(socket: WebSocket): void {
+/** Closing is best effort; a socket that refuses to close is already gone. */
+export function closeQuietly(socket: WebSocket): void {
 	try {
 		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
 	} catch {
-		// A socket that will not close is already gone.
+		// Nothing to do: the socket is unusable either way.
 	}
 }
 

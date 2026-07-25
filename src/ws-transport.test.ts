@@ -4,12 +4,14 @@ import {
 	createStats,
 	createWsFetch,
 	headerRecord,
+	isStaleContinuation,
 	knownUnsupportedParams,
 	resetUnsupportedParams,
 	toWebSocketUrl,
 	unsupportedParamFrom,
 	withoutMarker,
 } from "./ws-transport.ts";
+import { SocketPool } from "./continuation.ts";
 import { MARKER_HEADER } from "./fetch-hook.ts";
 
 /**
@@ -149,13 +151,13 @@ test("the HTTP fallback drops the marker so it cannot be routed back", async () 
 test("sends one response.create frame and re-emits events as SSE", async () => {
 	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
 	const stats = createStats();
-	const { fetch: wsFetch, used } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
+	const { fetch: wsFetch, sawRequest } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m", input: [], stream: true }));
 
 	assert.equal(response.status, 200);
 	assert.equal(response.headers.get("content-type"), "text/event-stream");
-	assert.equal(used(), true);
+	assert.equal(sawRequest(), true);
 
 	const socket = FakeWebSocket.instances[0]!;
 	assert.equal(socket.url, "wss://api.example.com/v1/responses");
@@ -172,44 +174,55 @@ test("sends one response.create frame and re-emits events as SSE", async () => {
 	assert.equal(stats.deltaRequests, 0);
 });
 
-test("transformBody rewrites the outgoing frame and counts a delta", async () => {
+test("the request is settled once the socket work ends", async () => {
+	// The caller releases process-wide resources here, so it has to fire on every
+	// path, not only when the event stream above resolves.
 	useFakeSocket([COMPLETED]);
-	const stats = createStats();
-	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
-		connectTimeoutMs: 1000,
-		stats,
-		transformBody: (body) => ({ ...body, previous_response_id: "resp_0", input: [{ role: "user" }] }),
-	});
-
-	const response = await wsFetch(
-		"https://api.example.com/v1/responses",
-		requestInit({ model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] }),
-	);
-	await response.text();
-
-	assert.deepEqual(JSON.parse(FakeWebSocket.instances[0]!.sent[0]!), {
-		type: "response.create",
-		model: "m",
-		previous_response_id: "resp_0",
-		input: [{ role: "user" }],
-	});
-	assert.equal(stats.deltaRequests, 1);
-	assert.equal(stats.fullRequests, 0);
-});
-
-test("terminal event is reported for continuation bookkeeping", async () => {
-	useFakeSocket([COMPLETED]);
-	const seen: unknown[] = [];
+	let settled = 0;
 	const { fetch: wsFetch } = createWsFetch({
 		realFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
-		onTerminal: (event) => seen.push(event),
+		onSettled: () => settled++,
 	});
+
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+	assert.equal(settled, 0, "the body still owns the socket");
 	await response.text();
-	assert.deepEqual(seen, [COMPLETED]);
+	assert.equal(settled, 1);
+});
+
+test("a fallback settles the request too", async () => {
+	useFakeSocket([], { failHandshake: true });
+	let settled = 0;
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: async () => new Response("sse-body"),
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+		onSettled: () => settled++,
+	});
+
+	await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+	assert.equal(settled, 1);
+});
+
+test("continuation state is recorded from the terminal event", async () => {
+	useFakeSocket([COMPLETED]);
+	const records: unknown[] = [];
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+		pool: new SocketPool(),
+		poolKey: "k",
+		onContinuation: (record) => records.push(record),
+	});
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m", input: [] }));
+	await response.text();
+
+	assert.deepEqual(records, [
+		{ requestBody: { model: "m", input: [] }, responseId: "resp_1", responseItems: [], complete: false },
+	]);
 });
 
 test("a wrapped error frame becomes an HTTP error response", async () => {
@@ -307,7 +320,7 @@ test("abort before connect surfaces as an abort, not a fallback", async () => {
 test("non-Responses requests pass straight through", async () => {
 	useFakeSocket([COMPLETED]);
 	let delegated = false;
-	const { fetch: wsFetch, used } = createWsFetch({
+	const { fetch: wsFetch, sawRequest } = createWsFetch({
 		realFetch: async () => {
 			delegated = true;
 			return new Response("models");
@@ -318,7 +331,100 @@ test("non-Responses requests pass straight through", async () => {
 
 	await wsFetch("https://api.example.com/v1/models", { method: "GET" });
 	assert.equal(delegated, true);
-	assert.equal(used(), false, "only the streaming Responses POST is intercepted");
+	assert.equal(sawRequest(), false, "only the streaming Responses POST is intercepted");
+});
+
+test("a stale continuation is recognised in either shape", () => {
+	assert.equal(
+		isStaleContinuation({ type: "error", status: 400, error: { code: "previous_response_not_found" } }),
+		true,
+	);
+	assert.equal(
+		isStaleContinuation({ type: "error", status: 400, error: { message: "Previous response not found" } }),
+		true,
+	);
+	assert.equal(isStaleContinuation({ type: "error", status: 429, error: { message: "slow down" } }), false);
+	assert.equal(isStaleContinuation({ type: "response.completed" }), false);
+});
+
+test("a rejected previous_response_id resends the full input on the same socket", async () => {
+	// The server no longer holds the response the delta chained onto. Nothing has
+	// streamed, so resending whole is safe, and it must not surface as an error.
+	const stale = { type: "error", status: 400, error: { code: "previous_response_not_found" } };
+	useFakeSocketTurns([[stale], [COMPLETED]]);
+
+	const pool = new SocketPool();
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats,
+		pool,
+		poolKey: "stale-key",
+	});
+
+	// Seed a socket that believes it can continue from resp_0.
+	const seeded = pool.add("stale-key", new FakeWebSocket("wss://api.example.com/v1/responses") as unknown as WebSocket);
+	seeded.continuation = {
+		requestBody: { model: "m", input: [{ role: "user" }] },
+		responseId: "resp_0",
+		responseItems: [{ role: "assistant" }],
+		complete: true,
+	};
+	pool.release(seeded, true);
+
+	const full = { model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] };
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit(full));
+
+	assert.equal(response.status, 200, "the recovery is invisible to the caller");
+	assert.deepEqual(await readSse(response), [COMPLETED]);
+
+	const sent = seeded.socket as unknown as FakeWebSocket;
+	assert.equal(sent.sent.length, 2, "both attempts went out on the one socket");
+	assert.equal(JSON.parse(sent.sent[0]!).previous_response_id, "resp_0", "first attempt was a delta");
+	assert.deepEqual(JSON.parse(sent.sent[1]!), { type: "response.create", ...full }, "retry sent everything");
+	assert.equal(stats.staleContinuations, 1);
+	assert.equal(stats.fullRequests, 1);
+	assert.equal(stats.deltaRequests, 0, "the abandoned delta is not counted as sent");
+	assert.equal(stats.sseFallbacks, 0);
+	assert.equal(stats.connected, 0, "no new handshake was needed");
+});
+
+test("a second stale rejection is surfaced instead of retried forever", async () => {
+	const stale = { type: "error", status: 400, error: { code: "previous_response_not_found" } };
+	useFakeSocketTurns([[stale], [stale]]);
+
+	const pool = new SocketPool();
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats,
+		pool,
+		poolKey: "stubborn-stale",
+	});
+
+	const seeded = pool.add(
+		"stubborn-stale",
+		new FakeWebSocket("wss://api.example.com/v1/responses") as unknown as WebSocket,
+	);
+	seeded.continuation = {
+		requestBody: { model: "m", input: [{ role: "user" }] },
+		responseId: "resp_0",
+		responseItems: [{ role: "assistant" }],
+		complete: true,
+	};
+	pool.release(seeded, true);
+
+	const response = await wsFetch(
+		"https://api.example.com/v1/responses",
+		requestInit({ model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] }),
+	);
+
+	// The retry carries no previous_response_id, so a repeat rejection is the server's
+	// answer to a full request and belongs to the caller.
+	assert.equal(response.status, 400);
+	assert.equal(stats.staleContinuations, 1);
 });
 
 test("unsupported parameter names are read out of the error message", () => {

@@ -2,10 +2,10 @@
  * WebSocket transport for the OpenAI Responses API, expressed as a `fetch`
  * replacement.
  *
- * The OpenAI SDK captures `globalThis.fetch` when a client is constructed. pi-ai's
- * `openai-responses` api builds its client synchronously, before its first `await`,
- * so a caller can swap the global for the duration of that synchronous window and
- * hand the SDK a transport that speaks WebSocket instead of HTTP.
+ * The OpenAI SDK takes `fetch` from `globalThis` when a client is constructed, so
+ * handing it one that speaks WebSocket replaces the transport without touching
+ * anything above it. Installing that fetch is `fetch-hook.ts`'s job; this module only
+ * implements the transport.
  *
  * Everything above this layer (request body construction, retries, error
  * formatting, usage accounting, abort handling) stays pi-ai's, unmodified.
@@ -17,7 +17,14 @@
 
 export type { FetchLike } from "./fetch-hook.ts";
 
-import { applyContinuation, responseIdFrom, type Continuation, type SocketPool } from "./continuation.ts";
+import {
+	applyContinuation,
+	closeQuietly,
+	responseIdFrom,
+	type Continuation,
+	type PooledSocket,
+	type SocketPool,
+} from "./continuation.ts";
 import { MARKER_HEADER, type FetchLike } from "./fetch-hook.ts";
 
 export interface WsStats {
@@ -35,6 +42,8 @@ export interface WsStats {
 	connectionsReused: number;
 	/** Parameters dropped because the endpoint rejected them. */
 	strippedParams: string[];
+	/** Deltas the server refused because it no longer held the previous response. */
+	staleContinuations: number;
 	lastError?: string;
 }
 
@@ -47,6 +56,7 @@ export function createStats(): WsStats {
 		fullRequests: 0,
 		connectionsReused: 0,
 		strippedParams: [],
+		staleContinuations: 0,
 	};
 }
 
@@ -61,13 +71,6 @@ export interface WsFetchOptions {
 	stats: WsStats;
 	/** Called once when a request falls back to HTTP SSE. */
 	onFallback?: (reason: string) => void;
-	/**
-	 * Rewrites the request body before it goes out, for `previous_response_id`
-	 * continuation. Returns the body to send.
-	 */
-	transformBody?: (body: Record<string, unknown>) => Record<string, unknown>;
-	/** Called with the terminal `response.*` event, for continuation bookkeeping. */
-	onTerminal?: (event: Record<string, unknown>) => void;
 	/**
 	 * Scope for remembering parameters the endpoint rejects, normally the provider
 	 * name. Relays that forward to a Codex-style backend accept a narrower parameter
@@ -89,6 +92,12 @@ export interface WsFetchOptions {
 	 * and flips `complete`, which is what allows the next request to send a delta.
 	 */
 	onContinuation?: (continuation: Continuation) => void;
+	/**
+	 * Called once the socket work for a request is over, whichever way it ended. The
+	 * caller uses it to release resources that must not outlive the request, without
+	 * having to wait for the event stream above to resolve.
+	 */
+	onSettled?: () => void;
 }
 
 /** Frames that end a response. */
@@ -111,9 +120,24 @@ export function resetUnsupportedParams(): void {
 /** `Unsupported parameter: max_output_tokens` -> `max_output_tokens`. */
 export function unsupportedParamFrom(frame: Record<string, unknown>): string | undefined {
 	if (frame.type !== "error") return undefined;
+	return /unsupported parameter:\s*'?([A-Za-z0-9_.]+)'?/i.exec(errorMessageOf(frame))?.[1];
+}
+
+/**
+ * Whether the endpoint rejected the `previous_response_id` a delta was built on.
+ * The response it referred to is gone, so the conversation has to be resent whole.
+ */
+export function isStaleContinuation(frame: Record<string, unknown>): boolean {
+	if (frame.type !== "error") return false;
+	const code = (frame.error as { code?: unknown } | undefined)?.code ?? frame.code;
+	if (code === "previous_response_not_found") return true;
+	return /previous_response_not_found|previous response .*not found/i.test(errorMessageOf(frame));
+}
+
+function errorMessageOf(frame: Record<string, unknown>): string {
 	const error = frame.error as { message?: unknown } | undefined;
-	const message = typeof error?.message === "string" ? error.message : typeof frame.message === "string" ? frame.message : "";
-	return /unsupported parameter:\s*'?([A-Za-z0-9_.]+)'?/i.exec(message)?.[1];
+	if (typeof error?.message === "string") return error.message;
+	return typeof frame.message === "string" ? frame.message : "";
 }
 
 /** Headers that describe an HTTP body or route this request, and mean nothing to a WebSocket handshake. */
@@ -126,8 +150,8 @@ const DROPPED_HEADERS = new Set([
 	MARKER_HEADER,
 ]);
 
-export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; used: () => boolean } {
-	let used = false;
+export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawRequest: () => boolean } {
+	let sawRequest = false;
 
 	const wsFetch: FetchLike = async (input, init) => {
 		const url = String(input instanceof Request ? input.url : input);
@@ -138,13 +162,21 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; used
 			return options.realFetch(input, init);
 		}
 
-		used = true;
+		sawRequest = true;
 		options.stats.attempts++;
+
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			options.onSettled?.();
+		};
 
 		const fallback = (reason: string): Promise<Response> => {
 			options.stats.sseFallbacks++;
 			options.stats.lastError = reason;
 			options.onFallback?.(reason);
+			settle();
 			// The marker has to go before delegating. With overlapping requests the fetch we
 			// captured may itself be a dispatcher, which would route the retry straight back
 			// here and loop.
@@ -163,113 +195,150 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; used
 		const scope = options.unsupportedScope ?? new URL(wsUrl).host;
 		const rejected = unsupportedParams.get(scope) ?? new Set<string>();
 		unsupportedParams.set(scope, rejected);
-		const pool = options.pool;
 		const poolKey = options.poolKey ?? scope;
 
-		for (let round = 0; ; round++) {
-			let entry = pool?.acquire(poolKey);
-			if (entry) {
-				options.stats.connectionsReused++;
-			} else {
-				let socket: WebSocket;
-				try {
-					socket = await connect(wsUrl, headers, options);
-				} catch (error) {
-					return fallback(errorText(error));
-				}
-				options.stats.connected++;
-				entry = pool?.add(poolKey, socket) ?? { socket, openedAt: Date.now(), lastUsedAt: Date.now(), busy: true };
-			}
+		let entry: PooledSocket | undefined;
+		// Set once the response body owns the socket. Until then this function is
+		// responsible for it, and the caller's resources must stay alive: pi-ai retries by
+		// calling fetch again on the same client, so releasing early would send the retry
+		// over HTTP.
+		let handedOff = false;
+		/** Ends the current attempt. `keep` pools the socket; otherwise it is closed. */
+		const finishAttempt = (keep: boolean) => {
+			if (!entry) return;
+			if (options.pool) options.pool.release(entry, keep);
+			else closeQuietly(entry.socket);
+			entry = undefined;
+		};
 
-			// The delta is computed against what this very socket last produced, never
-			// against a session-wide record: continuation state is connection local.
-			// Stripping happens first so the recorded body and the compared body agree.
-			const prepared = stripKeys(options.transformBody ? options.transformBody(body) : body, rejected);
-			const sent = applyContinuation(prepared, entry.continuation);
-			const done = (keep: boolean) => {
-				if (pool) pool.release(poolKey, entry!, keep);
-				else closeQuietly(entry!.socket);
-			};
-
-			try {
-				entry.socket.send(JSON.stringify({ type: "response.create", ...sent }));
-			} catch (error) {
-				done(false);
-				return fallback(`send failed: ${errorText(error)}`);
-			}
-
-			const frames = readFrames(entry.socket, {
-				...options,
-				onTerminal: (event) => {
-					const responseId = responseIdFrom(event);
-					if (responseId) {
-						// `prepared` is the full-input form of this request, which is what the
-						// next request's input has to extend.
-						const record: Continuation = { requestBody: prepared, responseId, responseItems: [], complete: false };
-						entry!.continuation = record;
-						options.onContinuation?.(record);
+		try {
+			for (let round = 0; ; round++) {
+				if (!entry) {
+					entry = options.pool?.acquire(poolKey);
+					if (entry) {
+						options.stats.connectionsReused++;
 					} else {
-						entry!.continuation = undefined;
+						let socket: WebSocket;
+						try {
+							socket = await connect(wsUrl, headers, options);
+						} catch (error) {
+							return fallback(errorText(error));
+						}
+						options.stats.connected++;
+						entry = options.pool?.add(poolKey, socket) ?? unpooledEntry(poolKey, socket);
 					}
-					options.onTerminal?.(event);
-				},
-			});
-			const first = await frames.next().catch((error: unknown) => {
-				// Nothing streamed yet, so retrying over HTTP is still safe.
-				return { done: true as const, value: error instanceof Error ? error : new Error(errorText(error)) };
-			});
-
-			if (first.done) {
-				done(false);
-				const reason = first.value instanceof Error ? first.value.message : "stream closed before any event";
-				return fallback(reason);
-			}
-
-			// Some relays accept a narrower parameter set over WebSocket than over HTTP and
-			// name the offending field. Drop it and retry: nothing has streamed yet.
-			const unsupported = unsupportedParamFrom(first.value);
-			if (unsupported && !rejected.has(unsupported) && round < MAX_STRIP_ROUNDS) {
-				rejected.add(unsupported);
-				options.stats.strippedParams = [...rejected];
-				done(false);
-				continue;
-			}
-
-			if (sent.previous_response_id) options.stats.deltaRequests++;
-			else options.stats.fullRequests++;
-
-			// A wrapped error frame carrying an HTTP status is reported as an HTTP error, so
-			// pi-ai's own retry and error formatting see exactly what they see over SSE.
-			const httpError = asHttpError(first.value);
-			if (httpError) {
-				entry.continuation = undefined;
-				done(false);
-				return httpError;
-			}
-
-			const encoder = new TextEncoder();
-			const sse = async function* () {
-				let complete = false;
-				try {
-					yield encoder.encode(sseFrame(first.value));
-					for await (const frame of frames) yield encoder.encode(sseFrame(frame));
-					complete = true;
-				} finally {
-					// An aborted or failed response leaves the server side in an unknown
-					// state, so the socket is dropped rather than reused.
-					if (!complete) entry!.continuation = undefined;
-					done(complete && !options.signal?.aborted);
 				}
-			};
+				const attempt = entry;
 
-			return new Response(ReadableStream.from(sse()), {
-				status: 200,
-				headers: { "content-type": "text/event-stream" },
-			});
+				// The delta is computed against what this very socket last produced, never
+				// against a session-wide record: continuation state is connection local.
+				// Stripping happens first so the recorded body and the compared body agree.
+				const prepared = stripKeys(body, rejected);
+				const sent = applyContinuation(prepared, attempt.continuation);
+
+				try {
+					attempt.socket.send(JSON.stringify({ type: "response.create", ...sent }));
+				} catch (error) {
+					finishAttempt(false);
+					return fallback(`send failed: ${errorText(error)}`);
+				}
+
+				const frames = readFrames(attempt.socket, options, (event) => {
+					const responseId = responseIdFrom(event);
+					if (!responseId) {
+						attempt.continuation = undefined;
+						return;
+					}
+					// `prepared` is the full-input form of this request, which is what the next
+					// request's input has to extend.
+					const record: Continuation = { requestBody: prepared, responseId, responseItems: [], complete: false };
+					attempt.continuation = record;
+					options.onContinuation?.(record);
+				});
+				const first = await frames.next().catch((error: unknown) => {
+					// Nothing streamed yet, so retrying over HTTP is still safe.
+					return { done: true as const, value: error instanceof Error ? error : new Error(errorText(error)) };
+				});
+
+				if (first.done) {
+					finishAttempt(false);
+					const reason = first.value instanceof Error ? first.value.message : "stream closed before any event";
+					return fallback(reason);
+				}
+
+				// Nothing has streamed yet, so the two recoveries below can resend safely.
+
+				// Some relays accept a narrower parameter set over WebSocket than over HTTP and
+				// name the offending field. Drop it and retry.
+				const unsupported = unsupportedParamFrom(first.value);
+				if (unsupported && !rejected.has(unsupported) && round < MAX_STRIP_ROUNDS) {
+					rejected.add(unsupported);
+					options.stats.strippedParams = [...rejected];
+					await frames.return(undefined);
+					finishAttempt(false);
+					continue;
+				}
+
+				// The server no longer holds the response the delta chained onto. Forget the
+				// continuation and resend the whole conversation on the same connection, once.
+				if (sent.previous_response_id && isStaleContinuation(first.value)) {
+					options.stats.staleContinuations++;
+					attempt.continuation = undefined;
+					await frames.return(undefined);
+					continue;
+				}
+
+				if (sent.previous_response_id) options.stats.deltaRequests++;
+				else options.stats.fullRequests++;
+
+				// A wrapped error frame carrying an HTTP status is reported as an HTTP error, so
+				// pi-ai's own retry and error formatting see exactly what they see over SSE.
+				const httpError = asHttpError(first.value);
+				if (httpError) {
+					attempt.continuation = undefined;
+					finishAttempt(false);
+					settle();
+					return httpError;
+				}
+
+				const encoder = new TextEncoder();
+				const sse = async function* () {
+					let complete = false;
+					try {
+						yield encoder.encode(sseFrame(first.value));
+						for await (const frame of frames) yield encoder.encode(sseFrame(frame));
+						complete = true;
+					} finally {
+						// An aborted or failed response leaves the server side in an unknown
+						// state, so the socket is dropped rather than reused.
+						if (!complete) attempt.continuation = undefined;
+						entry = attempt;
+						finishAttempt(complete && !options.signal?.aborted);
+						settle();
+					}
+				};
+
+				// The socket now belongs to the response body, which releases it when drained.
+				entry = undefined;
+				handedOff = true;
+				return new Response(ReadableStream.from(sse()), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+		} finally {
+			// Any path that leaves without handing the socket to a response body, including a
+			// throw, must not leave it checked out of the pool.
+			finishAttempt(false);
+			if (!handedOff) settle();
 		}
 	};
 
-	return { fetch: wsFetch, used: () => used };
+	return { fetch: wsFetch, sawRequest: () => sawRequest };
+}
+
+function unpooledEntry(key: string, socket: WebSocket): PooledSocket {
+	return { key, socket, openedAt: Date.now(), lastUsedAt: Date.now(), busy: true };
 }
 
 function sseFrame(event: unknown): string {
@@ -322,6 +391,8 @@ async function connect(
 ): Promise<WebSocket> {
 	// `headers` is a Node extension to the WebSocket constructor; it is how auth
 	// reaches the upgrade request.
+	// ponytail: no proxy handling. Bun ignores proxy env vars for WebSocket and needs
+	// a `proxy` option passed here; add it when someone runs this under Bun.
 	const socket = new WebSocket(url, { headers } as unknown as string[]);
 	socket.binaryType = "arraybuffer";
 
@@ -363,11 +434,13 @@ async function connect(
 
 /**
  * Yields parsed frames until a terminal `response.*` event. Throws if the socket
- * closes, errors, aborts, or goes idle first.
+ * closes, errors, aborts, or goes idle first. `onTerminal` fires before the terminal
+ * frame is yielded, so continuation state is recorded even if the consumer stops.
  */
 async function* readFrames(
 	socket: WebSocket,
-	options: Pick<WsFetchOptions, "idleTimeoutMs" | "signal" | "onTerminal">,
+	options: Pick<WsFetchOptions, "idleTimeoutMs" | "signal">,
+	onTerminal: (frame: Record<string, unknown>) => void,
 ): AsyncGenerator<Record<string, unknown>> {
 	const queue: Record<string, unknown>[] = [];
 	let wake: (() => void) | null = null;
@@ -387,26 +460,25 @@ async function* readFrames(
 	};
 
 	const onMessage = (event: MessageEvent) => {
-		void decode(event.data).then(
-			(text) => {
-				if (text === null) return;
-				let frame: Record<string, unknown>;
-				try {
-					frame = JSON.parse(text) as Record<string, unknown>;
-				} catch (error) {
-					fail(new Error(`invalid websocket JSON: ${errorText(error)}`));
-					return;
-				}
-				if (typeof frame.type === "string" && TERMINAL_TYPES.has(frame.type)) {
-					sawTerminal = true;
-					done = true;
-					options.onTerminal?.(frame);
-				}
-				queue.push(frame);
-				bump();
-			},
-			(error: unknown) => fail(new Error(`undecodable websocket frame: ${errorText(error)}`)),
-		);
+		const text = decode(event.data);
+		if (text === null) {
+			fail(new Error("unexpected binary websocket frame"));
+			return;
+		}
+		let frame: Record<string, unknown>;
+		try {
+			frame = JSON.parse(text) as Record<string, unknown>;
+		} catch (error) {
+			fail(new Error(`invalid websocket JSON: ${errorText(error)}`));
+			return;
+		}
+		if (typeof frame.type === "string" && TERMINAL_TYPES.has(frame.type)) {
+			sawTerminal = true;
+			done = true;
+			onTerminal(frame);
+		}
+		queue.push(frame);
+		bump();
 	};
 	const onError = () => fail(new Error("websocket error"));
 	const onClose = (event: CloseEvent) => {
@@ -473,26 +545,11 @@ function asHttpError(frame: Record<string, unknown>): Response | undefined {
 	return new Response(JSON.stringify({ error: payload }), { status: frame.status, headers });
 }
 
-async function decode(data: unknown): Promise<string | null> {
+/** Frame payload as text. `binaryType` is `arraybuffer`, so those are the only cases. */
+function decode(data: unknown): string | null {
 	if (typeof data === "string") return data;
 	if (data instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(data));
-	if (ArrayBuffer.isView(data)) {
-		const view = data as ArrayBufferView;
-		return new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-	}
-	if (data && typeof data === "object" && "arrayBuffer" in data) {
-		const buffer = await (data as Blob).arrayBuffer();
-		return new TextDecoder().decode(new Uint8Array(buffer));
-	}
 	return null;
-}
-
-function closeQuietly(socket: WebSocket): void {
-	try {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();
-	} catch {
-		// Closing is best effort; a socket that refuses to close is already dead.
-	}
 }
 
 export function errorText(error: unknown): string {

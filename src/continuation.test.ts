@@ -137,7 +137,7 @@ const stub = () => new StubSocket() as unknown as WebSocket;
 test("a released socket is handed back on the next request", () => {
 	const pool = new SocketPool();
 	const entry = pool.add("key", stub());
-	pool.release("key", entry, true);
+	pool.release(entry, true);
 
 	const reused = pool.acquire("key");
 	assert.equal(reused, entry);
@@ -156,7 +156,7 @@ test("a socket released without keep is closed and dropped", () => {
 	const pool = new SocketPool();
 	const socket = stub();
 	const entry = pool.add("key", socket);
-	pool.release("key", entry, false);
+	pool.release(entry, false);
 
 	assert.equal((socket as unknown as StubSocket).closed, true);
 	assert.equal(pool.size, 0);
@@ -167,7 +167,7 @@ test("an expired socket is dropped rather than reused", () => {
 	const pool = new SocketPool();
 	const socket = stub();
 	const entry = pool.add("key", socket, 0);
-	pool.release("key", entry, true, 0);
+	pool.release(entry, true, 0);
 
 	// Past the 55 minute age cap, ahead of the server's own 60 minute limit.
 	assert.equal(pool.acquire("key", 56 * 60 * 1000), undefined);
@@ -177,7 +177,7 @@ test("an expired socket is dropped rather than reused", () => {
 test("an idle socket is dropped rather than reused", () => {
 	const pool = new SocketPool();
 	const entry = pool.add("key", stub(), 0);
-	pool.release("key", entry, true, 0);
+	pool.release(entry, true, 0);
 	assert.equal(pool.acquire("key", 6 * 60 * 1000), undefined);
 });
 
@@ -185,7 +185,7 @@ test("a closed socket is not reused", () => {
 	const pool = new SocketPool();
 	const socket = stub();
 	const entry = pool.add("key", socket);
-	pool.release("key", entry, true);
+	pool.release(entry, true);
 	(socket as unknown as StubSocket).readyState = 3;
 
 	assert.equal(pool.acquire("key"), undefined);
@@ -195,7 +195,7 @@ test("a closed socket is not reused", () => {
 test("keys do not share sockets", () => {
 	const pool = new SocketPool();
 	const entry = pool.add("a", stub());
-	pool.release("a", entry, true);
+	pool.release(entry, true);
 	assert.equal(pool.acquire("b"), undefined);
 	assert.equal(pool.acquire("a"), entry);
 });
@@ -205,7 +205,7 @@ test("closeAll closes every socket", () => {
 	const first = stub();
 	const second = stub();
 	const a = pool.add("a", first);
-	pool.release("a", a, true);
+	pool.release(a, true);
 	pool.add("b", second);
 
 	pool.closeAll();
@@ -221,7 +221,7 @@ test("continuation follows the socket, not the key", () => {
 	const pool = new SocketPool();
 	const first = pool.add("key", stub());
 	first.continuation = continuation();
-	pool.release("key", first, true);
+	pool.release(first, true);
 
 	const second = pool.add("key", stub());
 	assert.equal(second.continuation, undefined);

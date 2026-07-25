@@ -93,7 +93,7 @@ export default function extension(pi: ExtensionAPI): void {
 			const line = providers.length
 				? `providers=${providers.join(",")} attempts=${stats.attempts} connected=${stats.connected} ` +
 					`reused=${stats.connectionsReused} open=${pool.size} full=${stats.fullRequests} ` +
-					`delta=${stats.deltaRequests} sseFallbacks=${stats.sseFallbacks}` +
+					`delta=${stats.deltaRequests} stale=${stats.staleContinuations} sseFallbacks=${stats.sseFallbacks}` +
 					(stats.strippedParams.length ? ` stripped=${stats.strippedParams.join(",")}` : "") +
 					(stats.lastError ? ` lastError="${stats.lastError}"` : "")
 				: "no providers configured; set openaiWebsocket.providers in settings.json";
@@ -153,8 +153,10 @@ export function streamOverWebSocket(
 	// caching gets a fresh connection each time and always sends the full input.
 	const pooled = transport !== "websocket";
 	let pending: Continuation | undefined;
+	// Assigned below, before any request can settle.
+	let releaseHook: () => void = () => {};
 
-	const { fetch: wsFetch, used } = createWsFetch({
+	const { fetch: wsFetch, sawRequest } = createWsFetch({
 		realFetch: globalThis.fetch as FetchLike,
 		connectTimeoutMs: options?.websocketConnectTimeoutMs ?? deps.settings.connectTimeoutMs,
 		idleTimeoutMs: options?.timeoutMs,
@@ -162,6 +164,9 @@ export function streamOverWebSocket(
 		stats: deps.stats,
 		unsupportedScope: model.provider,
 		onFallback: deps.warnFallback,
+		// Released as soon as the socket work ends, rather than waiting on the event
+		// stream above, which need not resolve if the turn is abandoned.
+		onSettled: () => releaseHook(),
 		...(pooled
 			? {
 					pool: deps.pool,
@@ -174,6 +179,7 @@ export function streamOverWebSocket(
 	});
 
 	const { marker, release } = installFetchHandler(wsFetch);
+	releaseHook = release;
 	let stream: AssistantMessageEventStream;
 	try {
 		stream = responsesApi.streamSimple(model, context, {
@@ -186,11 +192,15 @@ export function streamOverWebSocket(
 	}
 
 	void stream.result().then(async (message) => {
+		// Belt and braces: the transport releases on its own, but a request that never
+		// reached it would otherwise leave the hook installed for good.
 		release();
 
 		// Dispatch is keyed on a header pi-ai carries into the request. If it ever stops
-		// arriving, the request goes out over HTTP instead, so say so.
-		if (!used()) {
+		// arriving, the request goes out over HTTP instead, so say so and count it.
+		if (!sawRequest()) {
+			deps.stats.sseFallbacks++;
+			deps.stats.lastError = "transport hook was not reached";
 			deps.warnFallback("transport hook was not reached");
 			return;
 		}

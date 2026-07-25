@@ -44,6 +44,8 @@ A socket carries one request at a time. A busy socket is never handed out; a con
 own connection. Sockets are dropped after 5 minutes idle or 55 minutes of age, ahead of the documented
 60 minute server cap.
 
+A rejected `previous_response_id` is recovered from rather than surfaced: see ADR 0005.
+
 `transport: "websocket"` skips the pool entirely and always sends the full input. `websocket-cached` and
 `auto` use it.
 

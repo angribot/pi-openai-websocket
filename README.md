@@ -66,6 +66,11 @@ over HTTP, and answer with `Unsupported parameter: <name>`. The named parameter 
 is retried on a fresh socket, and the rejection is remembered for the rest of the process. Observed on
 one relay: `max_output_tokens` and `prompt_cache_options`.
 
+If the endpoint rejects the `previous_response_id` a delta chained onto, usually
+`previous_response_not_found`, the continuation is forgotten and the conversation is resent whole on the
+same socket, once. Both recoveries only happen before any event has streamed, and both are counted in
+`/ws-stats`. See ADR 0005.
+
 ## Continuation safety
 
 `previous_response_id` lets a follow-up request send only the new input items. A delta only goes out
