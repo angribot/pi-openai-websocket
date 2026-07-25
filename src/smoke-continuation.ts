@@ -13,7 +13,7 @@ import type { AssistantMessage, Message } from "@earendil-works/pi-ai/compat";
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
 import { loadTarget } from "./smoke-support.ts";
-import { createStats } from "./ws-transport.ts";
+import { createStats, formatStats } from "./ws-transport.ts";
 
 const providerName = process.argv[2] ?? "my-provider";
 const { model, apiKey } = loadTarget(providerName, process.argv[3]);
@@ -66,10 +66,6 @@ const third: Message[] = [
 ];
 await turn(third, "turn3");
 
-console.error(
-	`\nstats attempts=${stats.attempts} connected=${stats.connected} reused=${stats.connectionsReused} ` +
-		`full=${stats.fullRequests} delta=${stats.deltaRequests} stale=${stats.staleContinuations} ` +
-		`sseFallbacks=${stats.sseFallbacks}` +
-		(stats.strippedParams.length ? ` stripped=${stats.strippedParams.join(",")}` : ""),
-);
+console.error(`
+stats ${formatStats(stats)}`);
 pool.closeAll();

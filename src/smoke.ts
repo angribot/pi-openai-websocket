@@ -8,7 +8,7 @@
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
 import { loadTarget } from "./smoke-support.ts";
-import { createStats } from "./ws-transport.ts";
+import { createStats, formatStats } from "./ws-transport.ts";
 
 const providerName = process.argv[2] ?? "my-provider";
 const { model, apiKey, baseUrl } = loadTarget(providerName, process.argv[3]);
@@ -37,9 +37,4 @@ for await (const event of stream) {
 	}
 }
 
-console.error(
-	`stats attempts=${stats.attempts} connected=${stats.connected} full=${stats.fullRequests} ` +
-		`delta=${stats.deltaRequests} stale=${stats.staleContinuations} sseFallbacks=${stats.sseFallbacks}` +
-		(stats.strippedParams.length ? ` stripped=${stats.strippedParams.join(",")}` : "") +
-		(stats.lastError ? ` lastError="${stats.lastError}"` : ""),
-);
+console.error(`stats ${formatStats(stats)}`);

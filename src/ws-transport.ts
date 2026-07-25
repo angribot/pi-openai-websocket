@@ -60,6 +60,17 @@ export function createStats(): WsStats {
 	};
 }
 
+/** One-line rendering, shared by `/ws-stats` and the smoke scripts. */
+export function formatStats(stats: WsStats): string {
+	return (
+		`attempts=${stats.attempts} connected=${stats.connected} reused=${stats.connectionsReused} ` +
+		`full=${stats.fullRequests} delta=${stats.deltaRequests} stale=${stats.staleContinuations} ` +
+		`sseFallbacks=${stats.sseFallbacks}` +
+		(stats.strippedParams.length ? ` stripped=${stats.strippedParams.join(",")}` : "") +
+		(stats.lastError ? ` lastError="${stats.lastError}"` : "")
+	);
+}
+
 export interface WsFetchOptions {
 	/** The real fetch, used for the SSE fallback. */
 	realFetch: FetchLike;
@@ -113,6 +124,13 @@ export function knownUnsupportedParams(scope: string): string[] {
 	return [...(unsupportedParams.get(scope) ?? [])];
 }
 
+/** Every parameter any endpoint has rejected. `stats` spans providers, so this must too. */
+function allUnsupportedParams(): string[] {
+	const all = new Set<string>();
+	for (const set of unsupportedParams.values()) for (const name of set) all.add(name);
+	return [...all].sort();
+}
+
 export function resetUnsupportedParams(): void {
 	unsupportedParams.clear();
 }
@@ -157,9 +175,12 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 		const url = String(input instanceof Request ? input.url : input);
 		const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-		// Anything that is not the streaming Responses POST is none of our business.
+		// Anything that is not the streaming Responses POST is none of our business. The
+		// marker goes before delegating: with overlapping requests the fetch captured
+		// here is itself a dispatcher, which would route a still-marked request straight
+		// back into this function.
 		if (method !== "POST" || !new URL(url).pathname.endsWith("/responses") || typeof init?.body !== "string") {
-			return options.realFetch(input, init);
+			return options.realFetch(input, init ? { ...init, headers: withoutMarker(init.headers) } : init);
 		}
 
 		sawRequest = true;
@@ -176,10 +197,10 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			options.stats.sseFallbacks++;
 			options.stats.lastError = reason;
 			options.onFallback?.(reason);
+			// Settling here makes the fallback sticky for this request: pi-ai may retry the
+			// create call, and once the transport has failed there is no value in trying it
+			// again for the same turn.
 			settle();
-			// The marker has to go before delegating. With overlapping requests the fetch we
-			// captured may itself be a dispatcher, which would route the retry straight back
-			// here and loop.
 			return options.realFetch(input, { ...init, headers: withoutMarker(init.headers) });
 		};
 
@@ -198,21 +219,24 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 		const poolKey = options.poolKey ?? scope;
 
 		let entry: PooledSocket | undefined;
-		// Set once the response body owns the socket. Until then this function is
-		// responsible for it, and the caller's resources must stay alive: pi-ai retries by
-		// calling fetch again on the same client, so releasing early would send the retry
-		// over HTTP.
-		let handedOff = false;
-		/** Ends the current attempt. `keep` pools the socket; otherwise it is closed. */
-		const finishAttempt = (keep: boolean) => {
-			if (!entry) return;
-			if (options.pool) options.pool.release(entry, keep);
-			else closeQuietly(entry.socket);
-			entry = undefined;
+		// Set when a further fetch for this request is still possible, so the caller's
+		// resources must stay alive: pi-ai retries by calling fetch again on the same
+		// client, and releasing early would send that retry over HTTP. True while a
+		// response body still owns the socket, and true after an error pi-ai may retry.
+		let mayFetchAgain = false;
+		/** Ends an attempt. `keep` pools the socket; otherwise it is closed. */
+		const finish = (target: PooledSocket, keep: boolean) => {
+			if (entry === target) entry = undefined;
+			if (options.pool) options.pool.release(target, keep);
+			else closeQuietly(target.socket);
 		};
 
+		// Strip rounds are bounded separately from the stale-continuation retry, which is
+		// allowed exactly once and must not eat this budget.
+		let stripRounds = 0;
+
 		try {
-			for (let round = 0; ; round++) {
+			for (;;) {
 				if (!entry) {
 					entry = options.pool?.acquire(poolKey);
 					if (entry) {
@@ -239,7 +263,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 				try {
 					attempt.socket.send(JSON.stringify({ type: "response.create", ...sent }));
 				} catch (error) {
-					finishAttempt(false);
+					finish(attempt, false);
 					return fallback(`send failed: ${errorText(error)}`);
 				}
 
@@ -261,7 +285,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 				});
 
 				if (first.done) {
-					finishAttempt(false);
+					finish(attempt, false);
 					const reason = first.value instanceof Error ? first.value.message : "stream closed before any event";
 					return fallback(reason);
 				}
@@ -271,11 +295,12 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 				// Some relays accept a narrower parameter set over WebSocket than over HTTP and
 				// name the offending field. Drop it and retry.
 				const unsupported = unsupportedParamFrom(first.value);
-				if (unsupported && !rejected.has(unsupported) && round < MAX_STRIP_ROUNDS) {
+				if (unsupported && !rejected.has(unsupported) && stripRounds < MAX_STRIP_ROUNDS) {
+					stripRounds++;
 					rejected.add(unsupported);
-					options.stats.strippedParams = [...rejected];
+					options.stats.strippedParams = allUnsupportedParams();
 					await frames.return(undefined);
-					finishAttempt(false);
+					finish(attempt, false);
 					continue;
 				}
 
@@ -288,18 +313,21 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 					continue;
 				}
 
-				if (sent.previous_response_id) options.stats.deltaRequests++;
-				else options.stats.fullRequests++;
-
 				// A wrapped error frame carrying an HTTP status is reported as an HTTP error, so
-				// pi-ai's own retry and error formatting see exactly what they see over SSE.
+				// pi-ai's own retry and error formatting see exactly what they see over SSE. No
+				// settle: pi-ai may retry the create call, and that retry has to reach this
+				// transport rather than silently going out over HTTP.
 				const httpError = asHttpError(first.value);
 				if (httpError) {
 					attempt.continuation = undefined;
-					finishAttempt(false);
-					settle();
+					finish(attempt, false);
+					mayFetchAgain = true;
 					return httpError;
 				}
+
+				// Counted only once the frame is known to be a real response.
+				if (sent.previous_response_id) options.stats.deltaRequests++;
+				else options.stats.fullRequests++;
 
 				const encoder = new TextEncoder();
 				const sse = async function* () {
@@ -312,15 +340,14 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 						// An aborted or failed response leaves the server side in an unknown
 						// state, so the socket is dropped rather than reused.
 						if (!complete) attempt.continuation = undefined;
-						entry = attempt;
-						finishAttempt(complete && !options.signal?.aborted);
+						finish(attempt, complete && !options.signal?.aborted);
 						settle();
 					}
 				};
 
 				// The socket now belongs to the response body, which releases it when drained.
 				entry = undefined;
-				handedOff = true;
+				mayFetchAgain = true;
 				return new Response(ReadableStream.from(sse()), {
 					status: 200,
 					headers: { "content-type": "text/event-stream" },
@@ -328,9 +355,10 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			}
 		} finally {
 			// Any path that leaves without handing the socket to a response body, including a
-			// throw, must not leave it checked out of the pool.
-			finishAttempt(false);
-			if (!handedOff) settle();
+			// throw, must not leave it checked out of the pool. Releasing the caller's
+			// resources is separate, and waits while another fetch could still arrive.
+			if (entry) finish(entry, false);
+			if (!mayFetchAgain) settle();
 		}
 	};
 

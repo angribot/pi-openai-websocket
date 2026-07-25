@@ -334,6 +334,95 @@ test("non-Responses requests pass straight through", async () => {
 	assert.equal(sawRequest(), false, "only the streaming Responses POST is intercepted");
 });
 
+test("an unrelated request from the same client is delegated without its marker", async () => {
+	// With overlapping requests the captured fetch is itself the dispatcher. A
+	// still-marked pass-through would be routed back here and recurse forever.
+	useFakeSocket([COMPLETED]);
+	let delegatedHeaders: Record<string, string> | undefined;
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: async (_input, init) => {
+			delegatedHeaders = init?.headers as Record<string, string>;
+			return new Response("models");
+		},
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+	});
+
+	await wsFetch("https://api.example.com/v1/models", {
+		method: "GET",
+		headers: { authorization: "Bearer secret", [MARKER_HEADER]: "ws-1" },
+	});
+
+	assert.equal(delegatedHeaders?.[MARKER_HEADER], undefined);
+	assert.equal(delegatedHeaders?.authorization, "Bearer secret");
+});
+
+test("an HTTP error does not settle the request, so pi-ai's retry still reaches the transport", async () => {
+	// pi-ai retries 429 and 5xx by calling fetch again on the same client. Settling here
+	// would deregister the marker and send that retry over HTTP with no warning.
+	useFakeSocket([{ type: "error", status: 429, error: { message: "slow down" } }]);
+	let settled = 0;
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+		onSettled: () => settled++,
+	});
+
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+
+	assert.equal(response.status, 429);
+	assert.equal(settled, 0);
+});
+
+test("an HTTP error is not counted as a served request", async () => {
+	useFakeSocket([{ type: "error", status: 500, error: { message: "boom" } }]);
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
+
+	await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+
+	assert.equal(stats.fullRequests, 0);
+	assert.equal(stats.deltaRequests, 0);
+});
+
+test("a stale continuation retry does not consume the strip budget", async () => {
+	// ADR 0005 bounds the two recoveries separately: the stale retry is allowed once,
+	// stripping up to MAX_STRIP_ROUNDS.
+	const stale = { type: "error", status: 400, error: { code: "previous_response_not_found" } };
+	const reject = (param: string) => ({ type: "error", status: 400, error: { message: `Unsupported parameter: ${param}` } });
+	useFakeSocketTurns([[stale], [reject("p1")], [reject("p2")], [reject("p3")], [reject("p4")], [COMPLETED]]);
+
+	const pool = new SocketPool();
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats,
+		pool,
+		poolKey: "budget",
+	});
+
+	const seeded = pool.add("budget", new FakeWebSocket("wss://api.example.com/v1/responses") as unknown as WebSocket);
+	seeded.continuation = {
+		requestBody: { model: "m", input: [{ role: "user" }] },
+		responseId: "resp_0",
+		responseItems: [{ role: "assistant" }],
+		complete: true,
+	};
+	pool.release(seeded, true);
+
+	const response = await wsFetch(
+		"https://api.example.com/v1/responses",
+		requestInit({ model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] }),
+	);
+
+	assert.equal(response.status, 200, "one stale retry plus four strips all fit");
+	assert.deepEqual(await readSse(response), [COMPLETED]);
+	assert.equal(stats.staleContinuations, 1);
+	assert.deepEqual(stats.strippedParams, ["p1", "p2", "p3", "p4"]);
+});
+
 test("a stale continuation is recognised in either shape", () => {
 	assert.equal(
 		isStaleContinuation({ type: "error", status: 400, error: { code: "previous_response_not_found" } }),
@@ -388,6 +477,19 @@ test("a rejected previous_response_id resends the full input on the same socket"
 	assert.equal(stats.deltaRequests, 0, "the abandoned delta is not counted as sent");
 	assert.equal(stats.sseFallbacks, 0);
 	assert.equal(stats.connected, 0, "no new handshake was needed");
+});
+
+test("a stale continuation is recognised in either shape", () => {
+	assert.equal(
+		isStaleContinuation({ type: "error", status: 400, error: { code: "previous_response_not_found" } }),
+		true,
+	);
+	assert.equal(
+		isStaleContinuation({ type: "error", status: 400, error: { message: "Previous response not found" } }),
+		true,
+	);
+	assert.equal(isStaleContinuation({ type: "error", status: 429, error: { message: "slow down" } }), false);
+	assert.equal(isStaleContinuation({ type: "response.completed" }), false);
 });
 
 test("a second stale rejection is surfaced instead of retried forever", async () => {

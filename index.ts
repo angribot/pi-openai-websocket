@@ -29,7 +29,7 @@ import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SocketPool, serverItems, type Continuation } from "./src/continuation.ts";
 import { installFetchHandler, MARKER_HEADER } from "./src/fetch-hook.ts";
-import { createStats, createWsFetch, errorText, type FetchLike, type WsStats } from "./src/ws-transport.ts";
+import { createStats, createWsFetch, errorText, formatStats, type FetchLike, type WsStats } from "./src/ws-transport.ts";
 
 /**
  * pi's extension loader aliases the pi-ai root to the compat entrypoint and maps no
@@ -91,11 +91,7 @@ export default function extension(pi: ExtensionAPI): void {
 		description: "OpenAI Responses WebSocket transport stats",
 		handler: async (_args, ctx) => {
 			const line = providers.length
-				? `providers=${providers.join(",")} attempts=${stats.attempts} connected=${stats.connected} ` +
-					`reused=${stats.connectionsReused} open=${pool.size} full=${stats.fullRequests} ` +
-					`delta=${stats.deltaRequests} stale=${stats.staleContinuations} sseFallbacks=${stats.sseFallbacks}` +
-					(stats.strippedParams.length ? ` stripped=${stats.strippedParams.join(",")}` : "") +
-					(stats.lastError ? ` lastError="${stats.lastError}"` : "")
+				? `providers=${providers.join(",")} open=${pool.size} ${formatStats(stats)}`
 				: "no providers configured; set openaiWebsocket.providers in settings.json";
 			if (ctx.hasUI) ctx.ui.notify(line, "info");
 			else console.warn(line);

@@ -19,9 +19,10 @@ is stripped before the handshake and before any HTTP fallback, and never reaches
 **Dispatcher** — the `fetch` installed on `globalThis`. Routes by marker, reference counted so the
 original is restored when the last live request finishes. One per process, not one per request.
 
-**Settled** — the point where a request's socket work is over, whichever way it ended. Distinct from the
-event stream above resolving, which may be later or never. Resources that must not outlive a request are
-released on settle.
+**Settled** — the point where a request can no longer issue another `fetch`, so resources scoped to it may
+be released. Later than the socket being returned to the pool: an error pi-ai may retry keeps the request
+unsettled, because that retry has to reach this transport rather than going out over HTTP. Distinct from
+the event stream above resolving, which may be later or never.
 
 **Continuation** — the state that lets the next request send only new input items and reference the
 previous response by `previous_response_id`: the previous full-input request body, its response id, and the
