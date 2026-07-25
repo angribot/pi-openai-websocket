@@ -24,6 +24,12 @@ be released. Later than the socket being returned to the pool: an error pi-ai ma
 unsettled, because that retry has to reach this transport rather than going out over HTTP. Distinct from
 the event stream above resolving, which may be later or never.
 
+**Sweep** — the pool's periodic pass for sockets neither `acquire` nor `release` will look at: a session
+idle past the TTL, or a response body abandoned without being read or cancelled, whose socket would stay
+checked out. A busy socket is dropped only once it is past the age limit, since a long streaming turn is
+legitimately busy for minutes. The timer starts with the first socket, stops when the pool empties, and is
+unreferenced so it never holds the process open.
+
 **Continuation** — the state that lets the next request send only new input items and reference the
 previous response by `previous_response_id`: the previous full-input request body, its response id, and the
 items that response produced. Held on a pooled socket, never in a map keyed by session or model, because

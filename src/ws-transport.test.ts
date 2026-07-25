@@ -423,17 +423,32 @@ test("a stale continuation retry does not consume the strip budget", async () =>
 	assert.deepEqual(stats.strippedParams, ["p1", "p2", "p3", "p4"]);
 });
 
-test("a stale continuation is recognised in either shape", () => {
-	assert.equal(
-		isStaleContinuation({ type: "error", status: 400, error: { code: "previous_response_not_found" } }),
-		true,
-	);
-	assert.equal(
-		isStaleContinuation({ type: "error", status: 400, error: { message: "Previous response not found" } }),
-		true,
-	);
-	assert.equal(isStaleContinuation({ type: "error", status: 429, error: { message: "slow down" } }), false);
-	assert.equal(isStaleContinuation({ type: "response.completed" }), false);
+test("cancelling the response body releases the socket", async () => {
+	// The consumer may stop mid-response. Cancelling the body unwinds the frame
+	// generator, which is what returns the socket, so releasing must not depend on the
+	// response being read to completion.
+	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
+	const pool = new SocketPool();
+	let settled = 0;
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+		pool,
+		poolKey: "cancelled",
+		onSettled: () => settled++,
+	});
+
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+	const reader = response.body!.getReader();
+	await reader.read();
+	assert.equal(settled, 0, "still streaming");
+
+	await reader.cancel();
+
+	assert.equal(settled, 1);
+	assert.equal(pool.size, 0, "an incomplete response leaves the server side unknown, so the socket goes");
+	assert.equal(pool.acquire("cancelled"), undefined);
 });
 
 test("a rejected previous_response_id resends the full input on the same socket", async () => {

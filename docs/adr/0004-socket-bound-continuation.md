@@ -42,7 +42,10 @@ the pool, so an explicit `complete` flag gates the delta: an unfinalised baselin
 
 A socket carries one request at a time. A busy socket is never handed out; a concurrent request opens its
 own connection. Sockets are dropped after 5 minutes idle or 55 minutes of age, ahead of the documented
-60 minute server cap.
+60 minute server cap. Those limits are enforced when a socket is taken or returned, and by a sweep timer
+for the cases where neither happens: an idle session, or a response body abandoned without being read or
+cancelled, whose socket would otherwise stay checked out until the session ends. A busy socket is reclaimed
+only on age, never on idleness, because a long streaming turn is legitimately busy for minutes.
 
 A rejected `previous_response_id` is recovered from rather than surfaced: see ADR 0005.
 

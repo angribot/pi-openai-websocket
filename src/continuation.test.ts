@@ -215,6 +215,66 @@ test("closeAll closes every socket", () => {
 	assert.equal(pool.size, 0);
 });
 
+test("the sweep drops sockets nobody will ask for again", () => {
+	// acquire and release are the usual expiry checks, but a session can sit idle for
+	// longer than the TTL without either running.
+	const pool = new SocketPool(0);
+	const idle = stub();
+	const fresh = stub();
+	const a = pool.add("k", idle, 0);
+	pool.release(a, true, 0);
+	const b = pool.add("k", fresh, 6 * 60 * 1000);
+	pool.release(b, true, 6 * 60 * 1000);
+
+	assert.equal(pool.sweep(6 * 60 * 1000), 1, "only the one past its idle limit");
+	assert.equal((idle as unknown as StubSocket).closed, true);
+	assert.equal((fresh as unknown as StubSocket).closed, false);
+	assert.equal(pool.size, 1);
+});
+
+test("the sweep reclaims a busy socket only once it is past the age limit", () => {
+	// A response body can be abandoned without being read or cancelled, which leaves its
+	// socket checked out for good. Idleness cannot decide this, because a long streaming
+	// turn is legitimately busy for minutes; age can, because the server cuts the
+	// connection at 60 minutes anyway.
+	const pool = new SocketPool(0);
+	const abandoned = stub();
+	pool.add("k", abandoned, 0);
+
+	assert.equal(pool.sweep(30 * 60 * 1000), 0, "still plausibly streaming");
+	assert.equal(pool.size, 1);
+
+	assert.equal(pool.sweep(56 * 60 * 1000), 1);
+	assert.equal((abandoned as unknown as StubSocket).closed, true);
+	assert.equal(pool.size, 0);
+});
+
+test("releasing a swept socket is a no-op", () => {
+	// The sweep can drop a socket whose stream then unwinds and releases it.
+	const pool = new SocketPool(0);
+	const entry = pool.add("k", stub(), 0);
+	pool.sweep(56 * 60 * 1000);
+	assert.equal(pool.size, 0);
+
+	pool.release(entry, true, 56 * 60 * 1000);
+	assert.equal(pool.size, 0);
+});
+
+test("the sweep timer only runs while the pool holds something", () => {
+	const hasTimer = (pool: SocketPool) => (pool as unknown as { sweepTimer?: unknown }).sweepTimer !== undefined;
+	const pool = new SocketPool(1);
+	const entry = pool.add("k", stub());
+	assert.equal(hasTimer(pool), true);
+
+	pool.release(entry, false);
+	assert.equal(hasTimer(pool), false, "an empty pool keeps no timer");
+
+	pool.add("k", stub());
+	assert.equal(hasTimer(pool), true, "and starts again when refilled");
+	pool.closeAll();
+	assert.equal(hasTimer(pool), false);
+});
+
 test("continuation follows the socket, not the key", () => {
 	// One measured relay ignores previous_response_id and answers from whatever that
 	// connection produced last, so state must never be shared across sockets.

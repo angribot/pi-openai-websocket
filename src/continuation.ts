@@ -51,12 +51,27 @@ export interface PooledSocket {
 export const IDLE_TTL_MS = 5 * 60 * 1000;
 /** OpenAI documents a 60 minute server cap; stay clear of it. */
 export const MAX_AGE_MS = 55 * 60 * 1000;
+/** How often the pool looks for sockets to drop while nothing is being requested. */
+export const SWEEP_INTERVAL_MS = 60 * 1000;
 
 /**
  * Sockets keyed by pool key. Several sockets can share a key when requests overlap.
+ *
+ * Expiry is checked when a socket is taken or returned, and by a sweep timer for the
+ * case where neither happens: a session can sit idle for longer than the TTL, and a
+ * response body can be abandoned without ever being read or cancelled, which leaves
+ * its socket checked out. The timer starts with the first socket and stops when the
+ * pool empties, so it costs nothing when the transport is unused.
  */
 export class SocketPool {
 	private readonly entries = new Map<string, PooledSocket[]>();
+	private readonly sweepIntervalMs: number;
+	private sweepTimer: NodeJS.Timeout | undefined;
+
+	/** `sweepIntervalMs` of 0 disables the timer; the sweep can still be called. */
+	constructor(sweepIntervalMs = SWEEP_INTERVAL_MS) {
+		this.sweepIntervalMs = sweepIntervalMs;
+	}
 
 	/** An open, idle, non-expired socket for `key`, marked busy. */
 	acquire(key: string, now = Date.now()): PooledSocket | undefined {
@@ -76,6 +91,7 @@ export class SocketPool {
 			return entry;
 		}
 		if (bucket.length === 0) this.entries.delete(key);
+		this.stopSweepIfEmpty();
 		return undefined;
 	}
 
@@ -85,6 +101,7 @@ export class SocketPool {
 		const bucket = this.entries.get(key);
 		if (bucket) bucket.push(entry);
 		else this.entries.set(key, [entry]);
+		this.startSweep();
 		return entry;
 	}
 
@@ -94,12 +111,50 @@ export class SocketPool {
 		entry.lastUsedAt = now;
 		if (keep && !isUnusable(entry, now)) return;
 
+		this.drop(entry);
+	}
+
+	/**
+	 * Drops every socket that is past its idle or age limit.
+	 *
+	 * A socket still marked busy is only dropped on age, never on idleness: a long
+	 * streaming turn is legitimately busy for minutes, but one busy past the age limit
+	 * is either hung or abandoned, and the server would have cut it anyway.
+	 */
+	sweep(now = Date.now()): number {
+		let dropped = 0;
+		for (const bucket of [...this.entries.values()]) {
+			for (const entry of [...bucket]) {
+				if (!isUnusable(entry, now)) continue;
+				this.drop(entry);
+				dropped++;
+			}
+		}
+		return dropped;
+	}
+
+	private drop(entry: PooledSocket): void {
 		closeQuietly(entry.socket);
 		const bucket = this.entries.get(entry.key);
-		if (!bucket) return;
-		const index = bucket.indexOf(entry);
-		if (index >= 0) bucket.splice(index, 1);
-		if (bucket.length === 0) this.entries.delete(entry.key);
+		if (bucket) {
+			const index = bucket.indexOf(entry);
+			if (index >= 0) bucket.splice(index, 1);
+			if (bucket.length === 0) this.entries.delete(entry.key);
+		}
+		this.stopSweepIfEmpty();
+	}
+
+	private startSweep(): void {
+		if (this.sweepTimer || this.sweepIntervalMs <= 0) return;
+		this.sweepTimer = setInterval(() => this.sweep(), this.sweepIntervalMs);
+		// Never a reason to keep the process alive.
+		this.sweepTimer.unref?.();
+	}
+
+	private stopSweepIfEmpty(): void {
+		if (this.entries.size > 0 || !this.sweepTimer) return;
+		clearInterval(this.sweepTimer);
+		this.sweepTimer = undefined;
 	}
 
 	closeAll(): void {
@@ -107,6 +162,7 @@ export class SocketPool {
 			for (const entry of bucket) closeQuietly(entry.socket);
 		}
 		this.entries.clear();
+		this.stopSweepIfEmpty();
 	}
 
 	get size(): number {
@@ -117,11 +173,10 @@ export class SocketPool {
 }
 
 function isUnusable(entry: PooledSocket, now: number): boolean {
-	return (
-		entry.socket.readyState !== WebSocket.OPEN ||
-		now - entry.openedAt > MAX_AGE_MS ||
-		(!entry.busy && now - entry.lastUsedAt > IDLE_TTL_MS)
-	);
+	if (entry.socket.readyState !== WebSocket.OPEN) return true;
+	if (now - entry.openedAt > MAX_AGE_MS) return true;
+	// Idleness is meaningless while a request is streaming on the socket.
+	return !entry.busy && now - entry.lastUsedAt > IDLE_TTL_MS;
 }
 
 /** Closing is best effort; a socket that refuses to close is already gone. */
