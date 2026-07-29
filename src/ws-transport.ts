@@ -10,9 +10,9 @@
  * Everything above this layer (request body construction, retries, error
  * formatting, usage accounting, abort handling) stays pi-ai's, unmodified.
  *
- * Protocol: OpenAI's documented WebSocket mode for the Responses API.
+ * Protocol: the current Responses WebSocket protocol used by Codex.
  * `wss://{base}/responses`, one `{"type":"response.create", ...body}` text frame
- * per request, unwrapped `response.*` events back. No beta header.
+ * per request, unwrapped `response.*` events back, with the dated beta handshake.
  */
 
 export type { FetchLike } from "./fetch-hook.ts";
@@ -82,6 +82,8 @@ export interface WsFetchOptions {
 	stats: WsStats;
 	/** Called once when a request falls back to HTTP SSE. */
 	onFallback?: (reason: string) => void;
+	/** Called when WebSocket transport fails, so later requests can prefer SSE. */
+	onTransportUnavailable?: (failure: WsTransportUnavailable) => void;
 	/**
 	 * Scope for remembering parameters the endpoint rejects, normally the provider
 	 * name. Relays that forward to a Codex-style backend accept a narrower parameter
@@ -109,6 +111,11 @@ export interface WsFetchOptions {
 	 * having to wait for the event stream above to resolve.
 	 */
 	onSettled?: () => void;
+}
+
+export interface WsTransportUnavailable {
+	phase: "before-stream-start" | "after-stream-start";
+	reason: string;
 }
 
 /** Frames that end a response. */
@@ -147,9 +154,12 @@ export function unsupportedParamFrom(frame: Record<string, unknown>): string | u
  */
 export function isStaleContinuation(frame: Record<string, unknown>): boolean {
 	if (frame.type !== "error") return false;
-	const code = (frame.error as { code?: unknown } | undefined)?.code ?? frame.code;
-	if (code === "previous_response_not_found") return true;
+	if (errorCodeOf(frame) === "previous_response_not_found") return true;
 	return /previous_response_not_found|previous response .*not found/i.test(errorMessageOf(frame));
+}
+
+function errorCodeOf(frame: Record<string, unknown>): unknown {
+	return (frame.error as { code?: unknown } | undefined)?.code ?? frame.code;
 }
 
 function errorMessageOf(frame: Record<string, unknown>): string {
@@ -157,6 +167,14 @@ function errorMessageOf(frame: Record<string, unknown>): string {
 	if (typeof error?.message === "string") return error.message;
 	return typeof frame.message === "string" ? frame.message : "";
 }
+
+function isConnectionLimit(frame: Record<string, unknown>): boolean {
+	return frame.type === "error" && errorCodeOf(frame) === "websocket_connection_limit_reached";
+}
+
+const BETA_HEADER = "OpenAI-Beta";
+const BETA_VALUE = "responses_websockets=2026-02-06";
+const WEBSOCKET_DROPPED_BODY_FIELDS = new Set(["stream"]);
 
 /** Headers that describe an HTTP body or route this request, and mean nothing to a WebSocket handshake. */
 const DROPPED_HEADERS = new Set([
@@ -184,7 +202,6 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 		}
 
 		sawRequest = true;
-		options.stats.attempts++;
 
 		let settled = false;
 		const settle = () => {
@@ -193,6 +210,11 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			options.onSettled?.();
 		};
 
+		const reportUnavailable = (phase: WsTransportUnavailable["phase"], reason: string) => {
+			if (options.signal?.aborted) return;
+			options.stats.lastError = reason;
+			options.onTransportUnavailable?.({ phase, reason });
+		};
 		const fallback = (reason: string): Promise<Response> => {
 			options.stats.sseFallbacks++;
 			options.stats.lastError = reason;
@@ -203,6 +225,10 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			settle();
 			return options.realFetch(input, { ...init, headers: withoutMarker(init.headers) });
 		};
+		const fallbackUnavailable = (reason: string): Promise<Response> => {
+			reportUnavailable("before-stream-start", reason);
+			return fallback(reason);
+		};
 
 		let body: Record<string, unknown>;
 		try {
@@ -210,6 +236,14 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 		} catch (error) {
 			return fallback(`unparseable request body: ${errorText(error)}`);
 		}
+
+		if (body.background === true) {
+			settle();
+			return options.realFetch(input, { ...init, headers: withoutMarker(init.headers) });
+		}
+
+		options.stats.attempts++;
+		const websocketBody = stripKeys(body, WEBSOCKET_DROPPED_BODY_FIELDS);
 
 		const wsUrl = toWebSocketUrl(url);
 		const headers = headerRecord(init.headers);
@@ -231,14 +265,16 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			else closeQuietly(target.socket);
 		};
 
-		// Strip rounds are bounded separately from the stale-continuation retry, which is
-		// allowed exactly once and must not eat this budget.
+		// Recovery budgets are independent, so one endpoint quirk cannot starve another.
 		let stripRounds = 0;
+		let retriedConnectionLimit = false;
+		let forceFreshSocket = false;
 
 		try {
 			for (;;) {
 				if (!entry) {
-					entry = options.pool?.acquire(poolKey);
+					entry = forceFreshSocket ? undefined : options.pool?.acquire(poolKey);
+					forceFreshSocket = false;
 					if (entry) {
 						options.stats.connectionsReused++;
 					} else {
@@ -246,7 +282,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 						try {
 							socket = await connect(wsUrl, headers, options);
 						} catch (error) {
-							return fallback(errorText(error));
+							return fallbackUnavailable(errorText(error));
 						}
 						options.stats.connected++;
 						entry = options.pool?.add(poolKey, socket) ?? unpooledEntry(poolKey, socket);
@@ -257,14 +293,14 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 				// The delta is computed against what this very socket last produced, never
 				// against a session-wide record: continuation state is connection local.
 				// Stripping happens first so the recorded body and the compared body agree.
-				const prepared = stripKeys(body, rejected);
+				const prepared = stripKeys(websocketBody, rejected);
 				const sent = applyContinuation(prepared, attempt.continuation);
 
 				try {
-					attempt.socket.send(JSON.stringify({ type: "response.create", ...sent }));
+					attempt.socket.send(JSON.stringify({ ...sent, type: "response.create" }));
 				} catch (error) {
 					finish(attempt, false);
-					return fallback(`send failed: ${errorText(error)}`);
+					return fallbackUnavailable(`send failed: ${errorText(error)}`);
 				}
 
 				const frames = readFrames(attempt.socket, options, (event) => {
@@ -279,18 +315,34 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 					attempt.continuation = record;
 					options.onContinuation?.(record);
 				});
-				const first = await frames.next().catch((error: unknown) => {
-					// Nothing streamed yet, so retrying over HTTP is still safe.
-					return { done: true as const, value: error instanceof Error ? error : new Error(errorText(error)) };
-				});
+				let first: IteratorResult<Record<string, unknown>>;
+				try {
+					first = await frames.next();
+				} catch (error) {
+					finish(attempt, false);
+					return fallbackUnavailable(errorText(error));
+				}
 
 				if (first.done) {
 					finish(attempt, false);
-					const reason = first.value instanceof Error ? first.value.message : "stream closed before any event";
-					return fallback(reason);
+					return fallbackUnavailable("stream closed before any event");
 				}
 
-				// Nothing has streamed yet, so the two recoveries below can resend safely.
+				// A connection at its age limit is rejected before work starts. Retry once on
+				// a newly opened socket, independently of the other recovery budgets.
+				if (isConnectionLimit(first.value)) {
+					await frames.return(undefined);
+					finish(attempt, false);
+					if (!retriedConnectionLimit) {
+						retriedConnectionLimit = true;
+						forceFreshSocket = true;
+						continue;
+					}
+					const reason = errorMessageOf(first.value) || "websocket connection limit reached";
+					return fallbackUnavailable(reason);
+				}
+
+				// Nothing has streamed yet, so the remaining recoveries can resend safely.
 
 				// Some relays accept a narrower parameter set over WebSocket than over HTTP and
 				// name the offending field. Drop it and retry.
@@ -336,6 +388,9 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 						yield encoder.encode(sseFrame(first.value));
 						for await (const frame of frames) yield encoder.encode(sseFrame(frame));
 						complete = true;
+					} catch (error) {
+						reportUnavailable("after-stream-start", errorText(error));
+						throw error;
 					} finally {
 						// An aborted or failed response leaves the server side in an unknown
 						// state, so the socket is dropped rather than reused.
@@ -390,9 +445,11 @@ export function toWebSocketUrl(httpUrl: string): string {
 	return url.toString();
 }
 
-/** Headers to keep for the WebSocket handshake, dropping HTTP body and routing ones. */
+/** Headers for the WebSocket handshake, including the fixed current protocol opt-in. */
 export function headerRecord(headers: RequestInit["headers"]): Record<string, string> {
-	return filterHeaders(headers, (key) => !DROPPED_HEADERS.has(key));
+	const out = filterHeaders(headers, (key) => !DROPPED_HEADERS.has(key) && key !== "openai-beta");
+	out[BETA_HEADER] = BETA_VALUE;
+	return out;
 }
 
 /** Every header except the dispatch marker, which must never leave this process. */
@@ -498,6 +555,10 @@ async function* readFrames(
 			frame = JSON.parse(text) as Record<string, unknown>;
 		} catch (error) {
 			fail(new Error(`invalid websocket JSON: ${errorText(error)}`));
+			return;
+		}
+		if (frame.type === "codex.rate_limits") {
+			bump();
 			return;
 		}
 		if (typeof frame.type === "string" && TERMINAL_TYPES.has(frame.type)) {

@@ -7,6 +7,7 @@
 
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
+import { StickySseSessions } from "./session-fallback.ts";
 import { loadTarget } from "./smoke-support.ts";
 import { createStats, formatStats } from "./ws-transport.ts";
 
@@ -23,6 +24,7 @@ const stream = streamOverWebSocket(
 		settings: { providers: [providerName], transport: "websocket", connectTimeoutMs: 15_000 },
 		warnFallback: (reason) => console.error(`fallback: ${reason}`),
 		pool: new SocketPool(),
+		stickySseSessions: new StickySseSessions(),
 	},
 );
 

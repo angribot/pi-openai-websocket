@@ -12,6 +12,7 @@
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai/compat";
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
+import { StickySseSessions } from "./session-fallback.ts";
 import { loadTarget } from "./smoke-support.ts";
 import { createStats, formatStats } from "./ws-transport.ts";
 
@@ -25,6 +26,7 @@ const deps = {
 	settings: { providers: [providerName], transport: "websocket-cached" as const, connectTimeoutMs: 15_000 },
 	warnFallback: (reason: string) => console.error(`fallback: ${reason}`),
 	pool,
+	stickySseSessions: new StickySseSessions(),
 };
 
 const sessionId = `smoke-${Date.now()}`;

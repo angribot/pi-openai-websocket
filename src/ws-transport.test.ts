@@ -116,7 +116,14 @@ test("url and header handling", () => {
 	assert.equal(toWebSocketUrl("http://127.0.0.1:8080/v1/responses"), "ws://127.0.0.1:8080/v1/responses");
 
 	const headers = headerRecord({ authorization: "Bearer x", "content-type": "application/json", "x-keep": "1" });
-	assert.deepEqual(headers, { authorization: "Bearer x", "x-keep": "1" });
+	assert.deepEqual(headers, {
+		authorization: "Bearer x",
+		"x-keep": "1",
+		"OpenAI-Beta": "responses_websockets=2026-02-06",
+	});
+	assert.deepEqual(headerRecord({ "openai-beta": "older" }), {
+		"OpenAI-Beta": "responses_websockets=2026-02-06",
+	});
 
 	assert.equal(headerRecord({ [MARKER_HEADER]: "m1" })[MARKER_HEADER], undefined, "the marker never goes upstream");
 	assert.deepEqual(withoutMarker({ authorization: "Bearer x", [MARKER_HEADER]: "m1" }), { authorization: "Bearer x" });
@@ -128,9 +135,11 @@ test("the HTTP fallback drops the marker so it cannot be routed back", async () 
 	// fallback still carrying the marker would return here and loop.
 	useFakeSocket([], { failHandshake: true });
 	let delegatedHeaders: Record<string, string> | undefined;
+	let delegatedBody: BodyInit | null | undefined;
 	const { fetch: wsFetch } = createWsFetch({
 		realFetch: async (_input, init) => {
 			delegatedHeaders = init?.headers as Record<string, string>;
+			delegatedBody = init?.body;
 			return new Response("sse-body");
 		},
 		connectTimeoutMs: 1000,
@@ -139,10 +148,14 @@ test("the HTTP fallback drops the marker so it cannot be routed back", async () 
 
 	const response = await wsFetch(
 		"https://api.example.com/v1/responses",
-		requestInit({ model: "m" }, { authorization: "Bearer secret", [MARKER_HEADER]: "ws-1" }),
+		requestInit(
+			{ model: "m", stream: true },
+			{ authorization: "Bearer secret", "OpenAI-Beta": "caller-value", [MARKER_HEADER]: "ws-1" },
+		),
 	);
 
 	assert.equal(await response.text(), "sse-body");
+	assert.deepEqual(JSON.parse(String(delegatedBody)), { model: "m", stream: true });
 	assert.equal(delegatedHeaders?.[MARKER_HEADER], undefined);
 	assert.equal(delegatedHeaders?.authorization, "Bearer secret", "everything else survives");
 	assert.equal(delegatedHeaders?.["content-type"], "application/json", "including the HTTP body headers");
@@ -153,7 +166,10 @@ test("sends one response.create frame and re-emits events as SSE", async () => {
 	const stats = createStats();
 	const { fetch: wsFetch, sawRequest } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
 
-	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m", input: [], stream: true }));
+	const response = await wsFetch(
+		"https://api.example.com/v1/responses",
+		requestInit({ model: "m", input: [], stream: true, background: false, type: "caller-value" }),
+	);
 
 	assert.equal(response.status, 200);
 	assert.equal(response.headers.get("content-type"), "text/event-stream");
@@ -162,16 +178,45 @@ test("sends one response.create frame and re-emits events as SSE", async () => {
 	const socket = FakeWebSocket.instances[0]!;
 	assert.equal(socket.url, "wss://api.example.com/v1/responses");
 	assert.equal(socket.headers.authorization, "Bearer secret");
+	assert.equal(socket.headers["OpenAI-Beta"], "responses_websockets=2026-02-06");
 	assert.equal(socket.headers["content-type"], undefined, "HTTP body headers must not reach the handshake");
 
-	// The envelope is the request body with `type` merged in at the top level.
-	assert.deepEqual(JSON.parse(socket.sent[0]!), { type: "response.create", model: "m", input: [], stream: true });
+	// HTTP transport fields are omitted, and the transport owns the envelope type.
+	assert.deepEqual(JSON.parse(socket.sent[0]!), {
+		model: "m",
+		input: [],
+		background: false,
+		type: "response.create",
+	});
 
 	assert.deepEqual(await readSse(response), [{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
 	assert.equal(stats.attempts, 1);
 	assert.equal(stats.connected, 1);
 	assert.equal(stats.fullRequests, 1);
 	assert.equal(stats.deltaRequests, 0);
+});
+
+test("background requests bypass WebSocket without changing the HTTP request", async () => {
+	useFakeSocket([COMPLETED]);
+	const body = { model: "m", input: [], stream: true, background: true };
+	let delegatedBody: BodyInit | null | undefined;
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: async (_input, init) => {
+			delegatedBody = init?.body;
+			return new Response("background-body");
+		},
+		connectTimeoutMs: 1000,
+		stats,
+	});
+
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit(body));
+
+	assert.equal(await response.text(), "background-body");
+	assert.deepEqual(JSON.parse(String(delegatedBody)), body);
+	assert.equal(FakeWebSocket.instances.length, 0);
+	assert.equal(stats.attempts, 0);
+	assert.equal(stats.sseFallbacks, 0);
 });
 
 test("the request is settled once the socket work ends", async () => {
@@ -235,7 +280,13 @@ test("a wrapped error frame becomes an HTTP error response", async () => {
 		},
 	]);
 	const stats = createStats();
-	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
+	const unavailable: unknown[] = [];
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats,
+		onTransportUnavailable: (failure) => unavailable.push(failure),
+	});
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 
@@ -244,6 +295,20 @@ test("a wrapped error frame becomes an HTTP error response", async () => {
 	assert.equal(response.headers.get("retry-after-ms"), "1200");
 	assert.deepEqual(await response.json(), { error: { message: "slow down", type: "rate_limit_error" } });
 	assert.equal(stats.sseFallbacks, 0, "an HTTP error is a real answer, not a transport failure");
+	assert.deepEqual(unavailable, []);
+});
+
+test("Codex rate-limit events stay out of the Responses event stream", async () => {
+	useFakeSocket([
+		{ type: "codex.rate_limits", rate_limits: { primary: { used_percent: 10 } } },
+		{ type: "response.created", response: { id: "resp_1" } },
+		COMPLETED,
+	]);
+	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats() });
+
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+
+	assert.deepEqual(await readSse(response), [{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
 });
 
 test("an error frame without a status stays in the event stream", async () => {
@@ -256,15 +321,17 @@ test("an error frame without a status stays in the event stream", async () => {
 	assert.deepEqual((await readSse(response))[0], { type: "error", code: "invalid_request", message: "bad tool" });
 });
 
-test("handshake failure falls back to HTTP", async () => {
+test("handshake failure falls back to HTTP and reports transport unavailability", async () => {
 	useFakeSocket([], { failHandshake: true });
 	const stats = createStats();
 	const reasons: string[] = [];
+	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
 		realFetch: async () => new Response("sse-body", { status: 200 }),
 		connectTimeoutMs: 1000,
 		stats,
 		onFallback: (reason) => reasons.push(reason),
+		onTransportUnavailable: (failure) => unavailable.push(failure),
 	});
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
@@ -273,6 +340,7 @@ test("handshake failure falls back to HTTP", async () => {
 	assert.equal(stats.sseFallbacks, 1);
 	assert.equal(stats.connected, 0);
 	assert.match(reasons[0]!, /handshake failed/);
+	assert.deepEqual(unavailable, [{ phase: "before-stream-start", reason: "websocket handshake failed" }]);
 });
 
 test("a close before any event falls back to HTTP", async () => {
@@ -290,31 +358,62 @@ test("a close before any event falls back to HTTP", async () => {
 	assert.equal(stats.sseFallbacks, 1);
 });
 
-test("a close after streaming started surfaces as a stream error", async () => {
+test("a close after streaming started reports unavailability and surfaces as a stream error", async () => {
 	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }], { closeWithoutTerminal: true });
-	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats() });
+	const unavailable: unknown[] = [];
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+		onTransportUnavailable: (failure) => unavailable.push(failure),
+	});
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 
 	await assert.rejects(() => response.text(), /closed before a terminal response event/);
+	assert.deepEqual(unavailable, [
+		{ phase: "after-stream-start", reason: "websocket closed before a terminal response event (1006: boom)" },
+	]);
 });
 
-test("abort before connect surfaces as an abort, not a fallback", async () => {
+test("abort before connect does not report transport unavailability", async () => {
 	useFakeSocket([COMPLETED]);
 	const controller = new AbortController();
 	controller.abort();
 	const stats = createStats();
 	const reasons: string[] = [];
+	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
 		realFetch: async () => new Response("sse-body"),
 		connectTimeoutMs: 1000,
 		stats,
 		signal: controller.signal,
 		onFallback: (reason) => reasons.push(reason),
+		onTransportUnavailable: (failure) => unavailable.push(failure),
 	});
 
 	await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 	assert.match(reasons[0]!, /aborted/);
+	assert.deepEqual(unavailable, []);
+});
+
+test("a malformed request falls back without reporting transport unavailability", async () => {
+	useFakeSocket([COMPLETED]);
+	const unavailable: unknown[] = [];
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: async () => new Response("sse-body"),
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+		onTransportUnavailable: (failure) => unavailable.push(failure),
+	});
+
+	const response = await wsFetch("https://api.example.com/v1/responses", {
+		method: "POST",
+		body: "not-json",
+	});
+
+	assert.equal(await response.text(), "sse-body");
+	assert.deepEqual(unavailable, []);
 });
 
 test("non-Responses requests pass straight through", async () => {
@@ -384,6 +483,54 @@ test("an HTTP error is not counted as a served request", async () => {
 
 	assert.equal(stats.fullRequests, 0);
 	assert.equal(stats.deltaRequests, 0);
+});
+
+test("a connection-limit rejection retries once on a fresh socket", async () => {
+	const limit = {
+		type: "error",
+		status: 400,
+		error: { code: "websocket_connection_limit_reached", message: "create a new connection" },
+	};
+	useFakeSocketTurns([[limit], [COMPLETED]]);
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats,
+	});
+
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m", stream: true }));
+
+	assert.deepEqual(await readSse(response), [COMPLETED]);
+	assert.equal(FakeWebSocket.instances.length, 2);
+	assert.equal(FakeWebSocket.instances[0]!.closed, true);
+	assert.deepEqual(JSON.parse(FakeWebSocket.instances[1]!.sent[0]!), { type: "response.create", model: "m" });
+	assert.equal(stats.fullRequests, 1);
+	assert.equal(stats.sseFallbacks, 0);
+});
+
+test("an exhausted connection-limit retry falls back and reports transport unavailability", async () => {
+	const limit = {
+		type: "error",
+		status: 400,
+		error: { code: "websocket_connection_limit_reached", message: "create a new connection" },
+	};
+	useFakeSocketTurns([[limit], [limit], [COMPLETED]]);
+	const unavailable: unknown[] = [];
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({
+		realFetch: async () => new Response("sse-body"),
+		connectTimeoutMs: 1000,
+		stats,
+		onTransportUnavailable: (failure) => unavailable.push(failure),
+	});
+
+	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+
+	assert.equal(await response.text(), "sse-body");
+	assert.equal(FakeWebSocket.instances.length, 2, "the retry is bounded independently of other recoveries");
+	assert.equal(stats.sseFallbacks, 1);
+	assert.deepEqual(unavailable, [{ phase: "before-stream-start", reason: "create a new connection" }]);
 });
 
 test("a stale continuation retry does not consume the strip budget", async () => {

@@ -1,11 +1,12 @@
 # pi-openai-websocket
 
-WebSocket transport for the OpenAI Responses API in [pi](https://github.com/badlogic/pi-mono), for any
-third-party provider.
+WebSocket transport for the OpenAI Responses API in [pi](https://github.com/badlogic/pi-mono), for
+opted-in third-party providers.
 
 pi ships WebSocket support only inside `openai-codex-responses`, a proprietary api third-party providers
-cannot use. This extension gives the plain `openai-responses` api the same transport, using OpenAI's
-publicly documented [WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode).
+cannot use. This extension gives the plain `openai-responses` api the current Codex WebSocket transport
+while retaining HTTP/SSE when an endpoint cannot use it. The core request and event shapes follow OpenAI's
+[WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode).
 
 ## Install
 
@@ -55,9 +56,15 @@ Everything above the transport stays pi-ai's: request construction, retries, err
 accounting and abort handling. Frames are re-emitted as `text/event-stream` bytes so the SDK's own decoder
 parses them, which is why the event pipeline is shared rather than reimplemented.
 
+Every WebSocket handshake sends `OpenAI-Beta: responses_websockets=2026-02-06`. WebSocket frames omit the
+HTTP-only `stream` field; the original body remains intact for HTTP fallback. Requests with
+`background: true` go directly over HTTP. Codex rate-limit events are consumed out of band because the plain
+Responses decoder has no consumer for them.
+
 If the handshake fails, or the socket closes before any event, the request falls back to HTTP with one
-warning. A failure after streaming has started surfaces as a normal stream error, because retrying is no
-longer safe.
+warning. That named session then stays on HTTP. A failure after streaming has started surfaces as a normal
+stream error and moves later requests in the session to HTTP; API errors and user aborts do not. Calls
+without a session id do not share fallback state.
 
 ## Relay quirks
 
@@ -68,8 +75,9 @@ one relay: `max_output_tokens` and `prompt_cache_options`.
 
 If the endpoint rejects the `previous_response_id` a delta chained onto, usually
 `previous_response_not_found`, the continuation is forgotten and the conversation is resent whole on the
-same socket, once. Both recoveries only happen before any event has streamed, and both are counted in
-`/ws-stats`. See ADR 0005.
+same socket, once. If a connection reaches its server limit, a fresh socket is opened and tried once.
+These recoveries only happen before any response event has streamed. Parameter and stale-continuation
+recoveries are counted in `/ws-stats`. See ADR 0005 and ADR 0006.
 
 ## Continuation safety
 
@@ -97,8 +105,7 @@ Anything uncertain sends the full input, which is always correct and merely more
 
 - `azure-openai-responses`. Same protocol, different URL shape and Entra auth.
 - `generate: false` prewarm.
-- Codex v2 extensions: the `OpenAI-Beta` header, `client_metadata`, `x-codex-turn-state`,
-  `codex.rate_limits`.
+- Codex product state: `client_metadata`, `x-codex-turn-state` and rate-limit presentation.
 - Bun's proxy handling. Written for Node.
 - Socket cleanup on `SIGINT` under `--print`, where pi does not run session teardown.
 
