@@ -1,7 +1,7 @@
 # Context
 
-A pi extension that carries the OpenAI Responses API over WebSocket for any provider, so third-party
-endpoints do not need the proprietary `openai-codex-responses` api.
+A pi extension that carries the plain `openai-responses` api over the current Codex WebSocket transport
+for opted-in providers, with HTTP/SSE fallback when that transport is unavailable.
 
 ## Glossary
 
@@ -56,8 +56,8 @@ Rejections are remembered per provider for the rest of the process.
 not the socket. A close or EOF before one is an error.
 
 **SSE fallback** — completing a request over ordinary HTTP streaming after the WebSocket transport failed
-before anything streamed. A failure after streaming started is an error instead, because resending is no
-longer safe.
+before anything streamed. The named session then stays on HTTP. A failure after streaming started remains
+an error for that turn and moves later requests in the session to HTTP; API errors and user aborts do not.
 
 ## Decisions
 

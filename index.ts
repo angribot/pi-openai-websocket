@@ -29,6 +29,7 @@ import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SocketPool, serverItems, type Continuation } from "./src/continuation.ts";
 import { installFetchHandler, MARKER_HEADER } from "./src/fetch-hook.ts";
+import { StickySseSessions, shouldUseSse, type TransportSetting } from "./src/session-fallback.ts";
 import { createStats, createWsFetch, errorText, formatStats, type FetchLike, type WsStats } from "./src/ws-transport.ts";
 
 /**
@@ -48,11 +49,10 @@ interface WsSettings {
 	};
 }
 
-type TransportSetting = "sse" | "websocket" | "websocket-cached" | "auto";
-
 export default function extension(pi: ExtensionAPI): void {
 	const stats = createStats();
 	const pool = new SocketPool();
+	const stickySseSessions = new StickySseSessions();
 	let uiContext: ExtensionContext | undefined;
 	let warnedFallback = false;
 
@@ -71,7 +71,7 @@ export default function extension(pi: ExtensionAPI): void {
 		pi.registerProvider(provider, {
 			api: "openai-responses",
 			streamSimple: (model, context, options) =>
-				streamOverWebSocket(model, context, options, { stats, settings, warnFallback, pool }),
+				streamOverWebSocket(model, context, options, { stats, settings, warnFallback, pool, stickySseSessions }),
 		});
 	}
 
@@ -79,13 +79,18 @@ export default function extension(pi: ExtensionAPI): void {
 		uiContext = ctx;
 	});
 
-	pi.on("session_shutdown", () => {
+	const cleanup = (sessionId?: string) => {
+		stickySseSessions.clear(sessionId);
 		pool.closeAll();
+	};
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		cleanup(ctx.sessionManager.getSessionId());
 	});
 
 	// Modes without a session teardown still need the sockets gone, or the process
 	// lingers on a live connection.
-	if (providers.length > 0) registerSessionResourceCleanup(() => pool.closeAll());
+	if (providers.length > 0) registerSessionResourceCleanup(cleanup);
 
 	pi.registerCommand("ws-stats", {
 		description: "OpenAI Responses WebSocket transport stats",
@@ -125,6 +130,7 @@ export interface StreamDeps {
 	settings: ResolvedSettings;
 	warnFallback: (reason: string) => void;
 	pool: SocketPool;
+	stickySseSessions: StickySseSessions;
 }
 
 /**
@@ -143,7 +149,10 @@ export function streamOverWebSocket(
 	// `transport` is absent on non-agent calls such as compaction, so fall back to
 	// the configured value rather than assuming "auto".
 	const transport = (options?.transport as TransportSetting | undefined) ?? deps.settings.transport;
-	if (transport === "sse") return responsesApi.streamSimple(model, context, options);
+	const sessionId = options?.sessionId;
+	if (shouldUseSse(transport, sessionId, deps.stickySseSessions)) {
+		return responsesApi.streamSimple(model, context, options);
+	}
 
 	// Continuation needs a socket that survives between turns, so "websocket" without
 	// caching gets a fresh connection each time and always sends the full input.
@@ -160,6 +169,11 @@ export function streamOverWebSocket(
 		stats: deps.stats,
 		unsupportedScope: model.provider,
 		onFallback: deps.warnFallback,
+		onTransportUnavailable: ({ phase, reason }) => {
+			if (!sessionId) return;
+			deps.stickySseSessions.markSseOnly(sessionId);
+			if (phase === "after-stream-start") deps.warnFallback(reason);
+		},
 		// Released as soon as the socket work ends, rather than waiting on the event
 		// stream above, which need not resolve if the turn is abandoned.
 		onSettled: () => releaseHook(),
@@ -195,8 +209,10 @@ export function streamOverWebSocket(
 		// Dispatch is keyed on a header pi-ai carries into the request. If it ever stops
 		// arriving, the request goes out over HTTP instead, so say so and count it.
 		if (!sawRequest()) {
+			if (message.stopReason === "aborted") return;
 			deps.stats.sseFallbacks++;
 			deps.stats.lastError = "transport hook was not reached";
+			deps.stickySseSessions.markSseOnly(sessionId);
 			deps.warnFallback("transport hook was not reached");
 			return;
 		}

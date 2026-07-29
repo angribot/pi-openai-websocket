@@ -1,6 +1,6 @@
 # ADR 0001: Speak the public Responses WebSocket protocol, not Codex v2
 
-Status: accepted
+Status: superseded by ADR 0006
 Date: 2026-07-25
 
 ## Context
