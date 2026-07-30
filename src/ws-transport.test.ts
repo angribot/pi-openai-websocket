@@ -153,26 +153,6 @@ test("the HTTP fallback preserves the caller request", async () => {
 	assert.equal(delegatedHeaders?.["OpenAI-Beta"], "caller-value");
 });
 
-test("a transport failure keeps later fetches from the same request on HTTP", async () => {
-	useFakeSocket([], { failHandshake: true });
-	let fallbacks = 0;
-	const { fetch: wsFetch } = createWsFetch({
-		fallbackFetch: async () => {
-			fallbacks++;
-			return new Response("sse-body");
-		},
-		connectTimeoutMs: 1000,
-		stats: createStats(),
-	});
-	const init = requestInit({ model: "m", stream: true });
-
-	await wsFetch("https://api.example.com/v1/responses", init);
-	await wsFetch("https://api.example.com/v1/responses", init);
-
-	assert.equal(fallbacks, 2);
-	assert.equal(FakeWebSocket.instances.length, 1);
-});
-
 test("sends one response.create frame and re-emits events as SSE", async () => {
 	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
 	const stats = createStats();
@@ -396,57 +376,29 @@ test("a malformed request falls back without reporting transport unavailability"
 	assert.deepEqual(unavailable, []);
 });
 
-test("non-Responses requests pass straight through", async () => {
+test("non-Responses requests are delegated unchanged", async () => {
 	useFakeSocket([COMPLETED]);
-	let delegated = false;
+	let delegatedInput: string | URL | Request | undefined;
+	let delegatedInit: RequestInit | undefined;
 	const { fetch: wsFetch, sawRequest } = createWsFetch({
-		fallbackFetch: async () => {
-			delegated = true;
+		fallbackFetch: async (input, init) => {
+			delegatedInput = input;
+			delegatedInit = init;
 			return new Response("models");
 		},
 		connectTimeoutMs: 1000,
 		stats: createStats(),
 	});
-
-	await wsFetch("https://api.example.com/v1/models", { method: "GET" });
-	assert.equal(delegated, true);
-	assert.equal(sawRequest(), false, "only the streaming Responses POST is intercepted");
-});
-
-test("an unrelated request from the same client is delegated unchanged", async () => {
-	useFakeSocket([COMPLETED]);
-	let delegatedHeaders: Record<string, string> | undefined;
-	const { fetch: wsFetch } = createWsFetch({
-		fallbackFetch: async (_input, init) => {
-			delegatedHeaders = init?.headers as Record<string, string>;
-			return new Response("models");
-		},
-		connectTimeoutMs: 1000,
-		stats: createStats(),
-	});
-
-	await wsFetch("https://api.example.com/v1/models", {
+	const init = {
 		method: "GET",
 		headers: { authorization: "Bearer secret", "x-request-id": "request-1" },
-	});
+	};
 
-	assert.deepEqual(delegatedHeaders, { authorization: "Bearer secret", "x-request-id": "request-1" });
-});
+	await wsFetch("https://api.example.com/v1/models", init);
 
-test("an HTTP error leaves the injected transport available to pi-ai retries", async () => {
-	useFakeSocketTurns([[{ type: "error", status: 429, error: { message: "slow down" } }], [COMPLETED]]);
-	const { fetch: wsFetch } = createWsFetch({
-		fallbackFetch: noFallback(),
-		connectTimeoutMs: 1000,
-		stats: createStats(),
-	});
-
-	const first = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
-	const second = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
-
-	assert.equal(first.status, 429);
-	assert.deepEqual(await readSse(second), [COMPLETED]);
-	assert.equal(FakeWebSocket.instances.length, 2);
+	assert.equal(delegatedInput, "https://api.example.com/v1/models");
+	assert.equal(delegatedInit, init);
+	assert.equal(sawRequest(), false, "only the streaming Responses POST is intercepted");
 });
 
 test("an HTTP error is not counted as a served request", async () => {

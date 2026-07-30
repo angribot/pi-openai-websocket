@@ -106,7 +106,7 @@ function runStream(options: SimpleStreamOptions) {
 		warnFallback: () => {},
 		pool: new SocketPool(),
 		stickySseSessions: new StickySseSessions(),
-	}).result();
+	});
 }
 
 test("injects the WebSocket transport without replacing the caller fetch", async (t) => {
@@ -118,12 +118,36 @@ test("injects the WebSocket transport without replacing the caller fetch", async
 	};
 	useFakeWebSocket(t);
 
-	const message = await runStream({ apiKey: "secret", fetch: callerFetch, transport: "websocket" });
+	const stream = runStream({ apiKey: "secret", fetch: callerFetch, transport: "websocket" });
+	assert.equal(globalThis.fetch, originalFetch, "global fetch stays unchanged while the stream is active");
 
+	const message = await stream.result();
 	assert.equal(message.stopReason, "stop", message.errorMessage);
 	assert.equal(callerFetches, 0);
 	assert.equal(FakeWebSocket.instances.length, 1);
 	assert.equal(globalThis.fetch, originalFetch);
+});
+
+test("uses global fetch for fallback when the caller does not supply one", async (t) => {
+	const originalFetch = globalThis.fetch;
+	t.after(() => {
+		globalThis.fetch = originalFetch;
+	});
+	let globalFetches = 0;
+	let delegatedInput: string | URL | Request | undefined;
+	globalThis.fetch = async (input) => {
+		globalFetches++;
+		delegatedInput = input;
+		return sseResponse(completedFrame());
+	};
+	useFakeWebSocket(t, { failHandshakes: 1 });
+
+	const message = await runStream({ apiKey: "secret", transport: "websocket" }).result();
+
+	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assert.equal(globalFetches, 1);
+	assert.equal(String(delegatedInput), "https://api.example.com/v1/responses");
+	assert.equal(FakeWebSocket.instances.length, 1);
 });
 
 test("keeps pi-ai retries on caller fetch after WebSocket becomes unavailable", async (t) => {
@@ -145,7 +169,7 @@ test("keeps pi-ai retries on caller fetch after WebSocket becomes unavailable", 
 		fetch: callerFetch,
 		transport: "websocket",
 		maxRetries: 1,
-	});
+	}).result();
 
 	assert.equal(message.stopReason, "stop", message.errorMessage);
 	assert.equal(callerFetches, 2);
@@ -177,7 +201,7 @@ test("keeps pi-ai retries on WebSocket after a provider HTTP error", async (t) =
 		fetch: callerFetch,
 		transport: "websocket",
 		maxRetries: 1,
-	});
+	}).result();
 
 	assert.equal(message.stopReason, "stop", message.errorMessage);
 	assert.equal(callerFetches, 0);
