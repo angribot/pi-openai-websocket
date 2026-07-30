@@ -1,6 +1,6 @@
 {
   "name": "pi-openai-websocket",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WebSocket transport for the OpenAI Responses API in pi, for any third-party provider",
   "type": "module",
   "license": "MIT",
