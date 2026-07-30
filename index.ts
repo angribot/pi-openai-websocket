@@ -28,7 +28,6 @@ import {
 import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SocketPool, serverItems, type Continuation } from "./src/continuation.ts";
-import { installFetchHandler, MARKER_HEADER } from "./src/fetch-hook.ts";
 import { StickySseSessions, shouldUseSse, type TransportSetting } from "./src/session-fallback.ts";
 import { createStats, createWsFetch, errorText, formatStats, type FetchLike, type WsStats } from "./src/ws-transport.ts";
 
@@ -136,9 +135,9 @@ export interface StreamDeps {
 /**
  * Runs pi-ai's `openai-responses` stream with the WebSocket transport installed.
  *
- * pi-ai reaches its api implementations lazily, so the SDK client is built after an
- * `await` and the hook has to stay installed for the whole request. Dispatch is
- * opt-in through a marker header, so nothing else in the process is affected.
+ * pi-ai passes a per-request `fetch` into the OpenAI SDK. Injecting the WebSocket
+ * transport there keeps the swap request-local and preserves the caller's fetch for
+ * HTTP fallback.
  */
 export function streamOverWebSocket(
 	model: Model<Api>,
@@ -158,11 +157,9 @@ export function streamOverWebSocket(
 	// caching gets a fresh connection each time and always sends the full input.
 	const pooled = transport !== "websocket";
 	let pending: Continuation | undefined;
-	// Assigned below, before any request can settle.
-	let releaseHook: () => void = () => {};
 
 	const { fetch: wsFetch, sawRequest } = createWsFetch({
-		realFetch: globalThis.fetch as FetchLike,
+		fallbackFetch: (options?.fetch ?? globalThis.fetch) as FetchLike,
 		connectTimeoutMs: options?.websocketConnectTimeoutMs ?? deps.settings.connectTimeoutMs,
 		idleTimeoutMs: options?.timeoutMs,
 		signal: options?.signal,
@@ -174,9 +171,6 @@ export function streamOverWebSocket(
 			deps.stickySseSessions.markSseOnly(sessionId);
 			if (phase === "after-stream-start") deps.warnFallback(reason);
 		},
-		// Released as soon as the socket work ends, rather than waiting on the event
-		// stream above, which need not resolve if the turn is abandoned.
-		onSettled: () => releaseHook(),
 		...(pooled
 			? {
 					pool: deps.pool,
@@ -188,32 +182,17 @@ export function streamOverWebSocket(
 			: {}),
 	});
 
-	const { marker, release } = installFetchHandler(wsFetch);
-	releaseHook = release;
-	let stream: AssistantMessageEventStream;
-	try {
-		stream = responsesApi.streamSimple(model, context, {
-			...options,
-			headers: { ...options?.headers, [MARKER_HEADER]: marker },
-		});
-	} catch (error) {
-		release();
-		throw error;
-	}
+	const stream = responsesApi.streamSimple(model, context, { ...options, fetch: wsFetch });
 
 	void stream.result().then(async (message) => {
-		// Belt and braces: the transport releases on its own, but a request that never
-		// reached it would otherwise leave the hook installed for good.
-		release();
-
-		// Dispatch is keyed on a header pi-ai carries into the request. If it ever stops
-		// arriving, the request goes out over HTTP instead, so say so and count it.
+		// If pi-ai stops forwarding the injected fetch, report the lost transport rather
+		// than silently treating the request as WebSocket-backed.
 		if (!sawRequest()) {
 			if (message.stopReason === "aborted") return;
 			deps.stats.sseFallbacks++;
-			deps.stats.lastError = "transport hook was not reached";
+			deps.stats.lastError = "injected transport was not reached";
 			deps.stickySseSessions.markSseOnly(sessionId);
-			deps.warnFallback("transport hook was not reached");
+			deps.warnFallback("injected transport was not reached");
 			return;
 		}
 		if (!pending) return;
