@@ -1,6 +1,6 @@
 # ADR 0002: Swap the transport under pi-ai, do not reimplement the api
 
-Status: accepted
+Status: superseded by ADR 0007
 Date: 2026-07-25
 
 ## Context

@@ -9,10 +9,8 @@ import {
 	resetUnsupportedParams,
 	toWebSocketUrl,
 	unsupportedParamFrom,
-	withoutMarker,
 } from "./ws-transport.ts";
 import { SocketPool } from "./continuation.ts";
-import { MARKER_HEADER } from "./fetch-hook.ts";
 
 /**
  * Minimal stand-in for the global WebSocket. Scripted frames are delivered after
@@ -124,20 +122,14 @@ test("url and header handling", () => {
 	assert.deepEqual(headerRecord({ "openai-beta": "older" }), {
 		"OpenAI-Beta": "responses_websockets=2026-02-06",
 	});
-
-	assert.equal(headerRecord({ [MARKER_HEADER]: "m1" })[MARKER_HEADER], undefined, "the marker never goes upstream");
-	assert.deepEqual(withoutMarker({ authorization: "Bearer x", [MARKER_HEADER]: "m1" }), { authorization: "Bearer x" });
-	assert.deepEqual(withoutMarker({ "content-type": "application/json" }), { "content-type": "application/json" });
 });
 
-test("the HTTP fallback drops the marker so it cannot be routed back", async () => {
-	// With overlapping requests the captured fetch may itself be a dispatcher; a
-	// fallback still carrying the marker would return here and loop.
+test("the HTTP fallback preserves the caller request", async () => {
 	useFakeSocket([], { failHandshake: true });
 	let delegatedHeaders: Record<string, string> | undefined;
 	let delegatedBody: BodyInit | null | undefined;
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async (_input, init) => {
+		fallbackFetch: async (_input, init) => {
 			delegatedHeaders = init?.headers as Record<string, string>;
 			delegatedBody = init?.body;
 			return new Response("sse-body");
@@ -150,21 +142,41 @@ test("the HTTP fallback drops the marker so it cannot be routed back", async () 
 		"https://api.example.com/v1/responses",
 		requestInit(
 			{ model: "m", stream: true },
-			{ authorization: "Bearer secret", "OpenAI-Beta": "caller-value", [MARKER_HEADER]: "ws-1" },
+			{ authorization: "Bearer secret", "OpenAI-Beta": "caller-value" },
 		),
 	);
 
 	assert.equal(await response.text(), "sse-body");
 	assert.deepEqual(JSON.parse(String(delegatedBody)), { model: "m", stream: true });
-	assert.equal(delegatedHeaders?.[MARKER_HEADER], undefined);
-	assert.equal(delegatedHeaders?.authorization, "Bearer secret", "everything else survives");
-	assert.equal(delegatedHeaders?.["content-type"], "application/json", "including the HTTP body headers");
+	assert.equal(delegatedHeaders?.authorization, "Bearer secret");
+	assert.equal(delegatedHeaders?.["content-type"], "application/json");
+	assert.equal(delegatedHeaders?.["OpenAI-Beta"], "caller-value");
+});
+
+test("a transport failure keeps later fetches from the same request on HTTP", async () => {
+	useFakeSocket([], { failHandshake: true });
+	let fallbacks = 0;
+	const { fetch: wsFetch } = createWsFetch({
+		fallbackFetch: async () => {
+			fallbacks++;
+			return new Response("sse-body");
+		},
+		connectTimeoutMs: 1000,
+		stats: createStats(),
+	});
+	const init = requestInit({ model: "m", stream: true });
+
+	await wsFetch("https://api.example.com/v1/responses", init);
+	await wsFetch("https://api.example.com/v1/responses", init);
+
+	assert.equal(fallbacks, 2);
+	assert.equal(FakeWebSocket.instances.length, 1);
 });
 
 test("sends one response.create frame and re-emits events as SSE", async () => {
 	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
 	const stats = createStats();
-	const { fetch: wsFetch, sawRequest } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
+	const { fetch: wsFetch, sawRequest } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats });
 
 	const response = await wsFetch(
 		"https://api.example.com/v1/responses",
@@ -202,7 +214,7 @@ test("background requests bypass WebSocket without changing the HTTP request", a
 	let delegatedBody: BodyInit | null | undefined;
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async (_input, init) => {
+		fallbackFetch: async (_input, init) => {
 			delegatedBody = init?.body;
 			return new Response("background-body");
 		},
@@ -219,43 +231,11 @@ test("background requests bypass WebSocket without changing the HTTP request", a
 	assert.equal(stats.sseFallbacks, 0);
 });
 
-test("the request is settled once the socket work ends", async () => {
-	// The caller releases process-wide resources here, so it has to fire on every
-	// path, not only when the event stream above resolves.
-	useFakeSocket([COMPLETED]);
-	let settled = 0;
-	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
-		connectTimeoutMs: 1000,
-		stats: createStats(),
-		onSettled: () => settled++,
-	});
-
-	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
-	assert.equal(settled, 0, "the body still owns the socket");
-	await response.text();
-	assert.equal(settled, 1);
-});
-
-test("a fallback settles the request too", async () => {
-	useFakeSocket([], { failHandshake: true });
-	let settled = 0;
-	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async () => new Response("sse-body"),
-		connectTimeoutMs: 1000,
-		stats: createStats(),
-		onSettled: () => settled++,
-	});
-
-	await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
-	assert.equal(settled, 1);
-});
-
 test("continuation state is recorded from the terminal event", async () => {
 	useFakeSocket([COMPLETED]);
 	const records: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
 		pool: new SocketPool(),
@@ -282,7 +262,7 @@ test("a wrapped error frame becomes an HTTP error response", async () => {
 	const stats = createStats();
 	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 		onTransportUnavailable: (failure) => unavailable.push(failure),
@@ -304,7 +284,7 @@ test("Codex rate-limit events stay out of the Responses event stream", async () 
 		{ type: "response.created", response: { id: "resp_1" } },
 		COMPLETED,
 	]);
-	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats() });
+	const { fetch: wsFetch } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats() });
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 
@@ -313,7 +293,7 @@ test("Codex rate-limit events stay out of the Responses event stream", async () 
 
 test("an error frame without a status stays in the event stream", async () => {
 	useFakeSocket([{ type: "error", code: "invalid_request", message: "bad tool" }, COMPLETED]);
-	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats() });
+	const { fetch: wsFetch } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats() });
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 
@@ -327,7 +307,7 @@ test("handshake failure falls back to HTTP and reports transport unavailability"
 	const reasons: string[] = [];
 	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async () => new Response("sse-body", { status: 200 }),
+		fallbackFetch: async () => new Response("sse-body", { status: 200 }),
 		connectTimeoutMs: 1000,
 		stats,
 		onFallback: (reason) => reasons.push(reason),
@@ -347,7 +327,7 @@ test("a close before any event falls back to HTTP", async () => {
 	useFakeSocket([], { closeWithoutTerminal: true });
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async () => new Response("sse-body"),
+		fallbackFetch: async () => new Response("sse-body"),
 		connectTimeoutMs: 1000,
 		stats,
 	});
@@ -362,7 +342,7 @@ test("a close after streaming started reports unavailability and surfaces as a s
 	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }], { closeWithoutTerminal: true });
 	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
 		onTransportUnavailable: (failure) => unavailable.push(failure),
@@ -384,7 +364,7 @@ test("abort before connect does not report transport unavailability", async () =
 	const reasons: string[] = [];
 	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async () => new Response("sse-body"),
+		fallbackFetch: async () => new Response("sse-body"),
 		connectTimeoutMs: 1000,
 		stats,
 		signal: controller.signal,
@@ -401,7 +381,7 @@ test("a malformed request falls back without reporting transport unavailability"
 	useFakeSocket([COMPLETED]);
 	const unavailable: unknown[] = [];
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async () => new Response("sse-body"),
+		fallbackFetch: async () => new Response("sse-body"),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
 		onTransportUnavailable: (failure) => unavailable.push(failure),
@@ -420,7 +400,7 @@ test("non-Responses requests pass straight through", async () => {
 	useFakeSocket([COMPLETED]);
 	let delegated = false;
 	const { fetch: wsFetch, sawRequest } = createWsFetch({
-		realFetch: async () => {
+		fallbackFetch: async () => {
 			delegated = true;
 			return new Response("models");
 		},
@@ -433,13 +413,11 @@ test("non-Responses requests pass straight through", async () => {
 	assert.equal(sawRequest(), false, "only the streaming Responses POST is intercepted");
 });
 
-test("an unrelated request from the same client is delegated without its marker", async () => {
-	// With overlapping requests the captured fetch is itself the dispatcher. A
-	// still-marked pass-through would be routed back here and recurse forever.
+test("an unrelated request from the same client is delegated unchanged", async () => {
 	useFakeSocket([COMPLETED]);
 	let delegatedHeaders: Record<string, string> | undefined;
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async (_input, init) => {
+		fallbackFetch: async (_input, init) => {
 			delegatedHeaders = init?.headers as Record<string, string>;
 			return new Response("models");
 		},
@@ -449,35 +427,32 @@ test("an unrelated request from the same client is delegated without its marker"
 
 	await wsFetch("https://api.example.com/v1/models", {
 		method: "GET",
-		headers: { authorization: "Bearer secret", [MARKER_HEADER]: "ws-1" },
+		headers: { authorization: "Bearer secret", "x-request-id": "request-1" },
 	});
 
-	assert.equal(delegatedHeaders?.[MARKER_HEADER], undefined);
-	assert.equal(delegatedHeaders?.authorization, "Bearer secret");
+	assert.deepEqual(delegatedHeaders, { authorization: "Bearer secret", "x-request-id": "request-1" });
 });
 
-test("an HTTP error does not settle the request, so pi-ai's retry still reaches the transport", async () => {
-	// pi-ai retries 429 and 5xx by calling fetch again on the same client. Settling here
-	// would deregister the marker and send that retry over HTTP with no warning.
-	useFakeSocket([{ type: "error", status: 429, error: { message: "slow down" } }]);
-	let settled = 0;
+test("an HTTP error leaves the injected transport available to pi-ai retries", async () => {
+	useFakeSocketTurns([[{ type: "error", status: 429, error: { message: "slow down" } }], [COMPLETED]]);
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
-		onSettled: () => settled++,
 	});
 
-	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+	const first = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
+	const second = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 
-	assert.equal(response.status, 429);
-	assert.equal(settled, 0);
+	assert.equal(first.status, 429);
+	assert.deepEqual(await readSse(second), [COMPLETED]);
+	assert.equal(FakeWebSocket.instances.length, 2);
 });
 
 test("an HTTP error is not counted as a served request", async () => {
 	useFakeSocket([{ type: "error", status: 500, error: { message: "boom" } }]);
 	const stats = createStats();
-	const { fetch: wsFetch } = createWsFetch({ realFetch: noFallback(), connectTimeoutMs: 1000, stats });
+	const { fetch: wsFetch } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats });
 
 	await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 
@@ -494,7 +469,7 @@ test("a connection-limit rejection retries once on a fresh socket", async () => 
 	useFakeSocketTurns([[limit], [COMPLETED]]);
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 	});
@@ -519,7 +494,7 @@ test("an exhausted connection-limit retry falls back and reports transport unava
 	const unavailable: unknown[] = [];
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: async () => new Response("sse-body"),
+		fallbackFetch: async () => new Response("sse-body"),
 		connectTimeoutMs: 1000,
 		stats,
 		onTransportUnavailable: (failure) => unavailable.push(failure),
@@ -543,7 +518,7 @@ test("a stale continuation retry does not consume the strip budget", async () =>
 	const pool = new SocketPool();
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 		pool,
@@ -576,24 +551,19 @@ test("cancelling the response body releases the socket", async () => {
 	// response being read to completion.
 	useFakeSocket([{ type: "response.created", response: { id: "resp_1" } }, COMPLETED]);
 	const pool = new SocketPool();
-	let settled = 0;
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
 		pool,
 		poolKey: "cancelled",
-		onSettled: () => settled++,
 	});
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
 	const reader = response.body!.getReader();
 	await reader.read();
-	assert.equal(settled, 0, "still streaming");
-
 	await reader.cancel();
 
-	assert.equal(settled, 1);
 	assert.equal(pool.size, 0, "an incomplete response leaves the server side unknown, so the socket goes");
 	assert.equal(pool.acquire("cancelled"), undefined);
 });
@@ -607,7 +577,7 @@ test("a rejected previous_response_id resends the full input on the same socket"
 	const pool = new SocketPool();
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 		pool,
@@ -661,7 +631,7 @@ test("a second stale rejection is surfaced instead of retried forever", async ()
 	const pool = new SocketPool();
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 		pool,
@@ -713,7 +683,7 @@ test("a rejected parameter is dropped and the request retried", async () => {
 
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 		unsupportedScope: "test-provider",
@@ -741,7 +711,7 @@ test("a rejected parameter stays dropped for later requests", async () => {
 	useFakeSocketTurns([[reject], [COMPLETED], [COMPLETED]]);
 	const stats = createStats();
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
 		unsupportedScope: "sticky-provider",
@@ -763,7 +733,7 @@ test("a persistent rejection eventually stops retrying", async () => {
 	]);
 	useFakeSocketTurns(turns);
 	const { fetch: wsFetch } = createWsFetch({
-		realFetch: noFallback(),
+		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
 		unsupportedScope: "stubborn",

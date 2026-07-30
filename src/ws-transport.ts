@@ -2,10 +2,9 @@
  * WebSocket transport for the OpenAI Responses API, expressed as a `fetch`
  * replacement.
  *
- * The OpenAI SDK takes `fetch` from `globalThis` when a client is constructed, so
- * handing it one that speaks WebSocket replaces the transport without touching
- * anything above it. Installing that fetch is `fetch-hook.ts`'s job; this module only
- * implements the transport.
+ * Pi-ai passes a per-request `fetch` to the OpenAI SDK. Handing it one that speaks
+ * WebSocket replaces the transport without touching anything above it or mutating
+ * process-global state.
  *
  * Everything above this layer (request body construction, retries, error
  * formatting, usage accounting, abort handling) stays pi-ai's, unmodified.
@@ -15,7 +14,7 @@
  * per request, unwrapped `response.*` events back, with the dated beta handshake.
  */
 
-export type { FetchLike } from "./fetch-hook.ts";
+export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 import {
 	applyContinuation,
@@ -25,7 +24,6 @@ import {
 	type PooledSocket,
 	type SocketPool,
 } from "./continuation.ts";
-import { MARKER_HEADER, type FetchLike } from "./fetch-hook.ts";
 
 export interface WsStats {
 	/** Requests that attempted the WebSocket transport. */
@@ -72,8 +70,8 @@ export function formatStats(stats: WsStats): string {
 }
 
 export interface WsFetchOptions {
-	/** The real fetch, used for the SSE fallback. */
-	realFetch: FetchLike;
+	/** Caller-provided fetch, used for pass-through requests and SSE fallback. */
+	fallbackFetch: FetchLike;
 	/** Handshake budget. 0 disables the timeout. */
 	connectTimeoutMs: number;
 	/** Per-frame idle budget. Undefined or 0 disables it. */
@@ -105,12 +103,6 @@ export interface WsFetchOptions {
 	 * and flips `complete`, which is what allows the next request to send a delta.
 	 */
 	onContinuation?: (continuation: Continuation) => void;
-	/**
-	 * Called once the socket work for a request is over, whichever way it ended. The
-	 * caller uses it to release resources that must not outlive the request, without
-	 * having to wait for the event stream above to resolve.
-	 */
-	onSettled?: () => void;
 }
 
 export interface WsTransportUnavailable {
@@ -176,42 +168,28 @@ const BETA_HEADER = "OpenAI-Beta";
 const BETA_VALUE = "responses_websockets=2026-02-06";
 const WEBSOCKET_DROPPED_BODY_FIELDS = new Set(["stream"]);
 
-/** Headers that describe an HTTP body or route this request, and mean nothing to a WebSocket handshake. */
-const DROPPED_HEADERS = new Set([
-	"content-type",
-	"content-length",
-	"accept",
-	"accept-encoding",
-	"connection",
-	MARKER_HEADER,
-]);
+/** Headers that describe an HTTP body and mean nothing to a WebSocket handshake. */
+const DROPPED_HEADERS = new Set(["content-type", "content-length", "accept", "accept-encoding", "connection"]);
 
 export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawRequest: () => boolean } {
 	let sawRequest = false;
+	let transportUnavailable = false;
 
 	const wsFetch: FetchLike = async (input, init) => {
 		const url = String(input instanceof Request ? input.url : input);
 		const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
 
-		// Anything that is not the streaming Responses POST is none of our business. The
-		// marker goes before delegating: with overlapping requests the fetch captured
-		// here is itself a dispatcher, which would route a still-marked request straight
-		// back into this function.
+		// Anything that is not the streaming Responses POST is none of our business.
 		if (method !== "POST" || !new URL(url).pathname.endsWith("/responses") || typeof init?.body !== "string") {
-			return options.realFetch(input, init ? { ...init, headers: withoutMarker(init.headers) } : init);
+			return options.fallbackFetch(input, init);
 		}
+		if (transportUnavailable) return options.fallbackFetch(input, init);
 
 		sawRequest = true;
 
-		let settled = false;
-		const settle = () => {
-			if (settled) return;
-			settled = true;
-			options.onSettled?.();
-		};
-
 		const reportUnavailable = (phase: WsTransportUnavailable["phase"], reason: string) => {
 			if (options.signal?.aborted) return;
+			transportUnavailable = true;
 			options.stats.lastError = reason;
 			options.onTransportUnavailable?.({ phase, reason });
 		};
@@ -219,11 +197,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			options.stats.sseFallbacks++;
 			options.stats.lastError = reason;
 			options.onFallback?.(reason);
-			// Settling here makes the fallback sticky for this request: pi-ai may retry the
-			// create call, and once the transport has failed there is no value in trying it
-			// again for the same turn.
-			settle();
-			return options.realFetch(input, { ...init, headers: withoutMarker(init.headers) });
+			return options.fallbackFetch(input, init);
 		};
 		const fallbackUnavailable = (reason: string): Promise<Response> => {
 			reportUnavailable("before-stream-start", reason);
@@ -237,10 +211,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 			return fallback(`unparseable request body: ${errorText(error)}`);
 		}
 
-		if (body.background === true) {
-			settle();
-			return options.realFetch(input, { ...init, headers: withoutMarker(init.headers) });
-		}
+		if (body.background === true) return options.fallbackFetch(input, init);
 
 		options.stats.attempts++;
 		const websocketBody = stripKeys(body, WEBSOCKET_DROPPED_BODY_FIELDS);
@@ -253,11 +224,6 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 		const poolKey = options.poolKey ?? scope;
 
 		let entry: PooledSocket | undefined;
-		// Set when a further fetch for this request is still possible, so the caller's
-		// resources must stay alive: pi-ai retries by calling fetch again on the same
-		// client, and releasing early would send that retry over HTTP. True while a
-		// response body still owns the socket, and true after an error pi-ai may retry.
-		let mayFetchAgain = false;
 		/** Ends an attempt. `keep` pools the socket; otherwise it is closed. */
 		const finish = (target: PooledSocket, keep: boolean) => {
 			if (entry === target) entry = undefined;
@@ -366,14 +332,11 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 				}
 
 				// A wrapped error frame carrying an HTTP status is reported as an HTTP error, so
-				// pi-ai's own retry and error formatting see exactly what they see over SSE. No
-				// settle: pi-ai may retry the create call, and that retry has to reach this
-				// transport rather than silently going out over HTTP.
+				// pi-ai's own retry and error formatting see exactly what they see over SSE.
 				const httpError = asHttpError(first.value);
 				if (httpError) {
 					attempt.continuation = undefined;
 					finish(attempt, false);
-					mayFetchAgain = true;
 					return httpError;
 				}
 
@@ -396,24 +359,25 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 						// state, so the socket is dropped rather than reused.
 						if (!complete) attempt.continuation = undefined;
 						finish(attempt, complete && !options.signal?.aborted);
-						settle();
 					}
 				};
 
 				// The socket now belongs to the response body, which releases it when drained.
 				entry = undefined;
-				mayFetchAgain = true;
-				return new Response(ReadableStream.from(sse()), {
+				const responseBody = (
+					ReadableStream as typeof ReadableStream & {
+						from<T>(source: AsyncIterable<T>): ReadableStream<T>;
+					}
+				).from(sse());
+				return new Response(responseBody, {
 					status: 200,
 					headers: { "content-type": "text/event-stream" },
 				});
 			}
 		} finally {
 			// Any path that leaves without handing the socket to a response body, including a
-			// throw, must not leave it checked out of the pool. Releasing the caller's
-			// resources is separate, and waits while another fetch could still arrive.
+			// throw, must not leave it checked out of the pool.
 			if (entry) finish(entry, false);
-			if (!mayFetchAgain) settle();
 		}
 	};
 
@@ -450,11 +414,6 @@ export function headerRecord(headers: RequestInit["headers"]): Record<string, st
 	const out = filterHeaders(headers, (key) => !DROPPED_HEADERS.has(key) && key !== "openai-beta");
 	out[BETA_HEADER] = BETA_VALUE;
 	return out;
-}
-
-/** Every header except the dispatch marker, which must never leave this process. */
-export function withoutMarker(headers: RequestInit["headers"]): Record<string, string> {
-	return filterHeaders(headers, (key) => key !== MARKER_HEADER);
 }
 
 function filterHeaders(headers: RequestInit["headers"], keep: (lowerKey: string) => boolean): Record<string, string> {

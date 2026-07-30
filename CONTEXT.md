@@ -6,23 +6,17 @@ for opted-in providers, with HTTP/SSE fallback when that transport is unavailabl
 ## Glossary
 
 **Transport swap** — replacing the HTTP transport under pi-ai's `openai-responses` api rather than
-reimplementing the api. The OpenAI SDK takes `fetch` from `globalThis` at client construction, so a
-substitute `fetch` that speaks WebSocket changes the transport and nothing else. Avoid "shim" and "patch"
-for this; both understate that request construction, retries, error formatting, usage accounting and abort
-handling remain pi-ai's.
+reimplementing the api. Pi-ai passes a per-request `fetch` to the OpenAI SDK, so a substitute `fetch` that
+speaks WebSocket changes the transport and nothing else. Avoid "shim" and "patch" for this; both understate
+that request construction, retries, error formatting, usage accounting and abort handling remain pi-ai's.
 
-**Marker header** — `x-pi-openai-websocket`, carried on a request so the installed dispatcher knows the
-request belongs to this extension. Requests without a recognised marker go to the fetch that was in place
-beforehand. This is what makes a process-global mutation safe: it is inert for everything else. The marker
-is stripped before the handshake and before any HTTP fallback, and never reaches a provider.
+**Injected fetch** — the request-local `fetch` passed through pi-ai to the OpenAI SDK. It routes Responses
+POSTs over WebSocket and delegates unrelated requests or HTTP fallback to the caller's original fetch. It
+never replaces `globalThis.fetch`.
 
-**Dispatcher** — the `fetch` installed on `globalThis`. Routes by marker, reference counted so the
-original is restored when the last live request finishes. One per process, not one per request.
-
-**Settled** — the point where a request can no longer issue another `fetch`, so resources scoped to it may
-be released. Later than the socket being returned to the pool: an error pi-ai may retry keeps the request
-unsettled, because that retry has to reach this transport rather than going out over HTTP. Distinct from
-the event stream above resolving, which may be later or never.
+**Fallback fetch** — `options.fetch` when the caller supplied one, otherwise `globalThis.fetch`. WebSocket
+failures delegate the original request to it unchanged. Once a WebSocket failure makes the transport
+unavailable, later SDK retries from the same request continue through this fetch.
 
 **Sweep** — the pool's periodic pass for sockets neither `acquire` nor `release` will look at: a session
 idle past the TTL, or a response body abandoned without being read or cancelled, whose socket would stay
