@@ -16,9 +16,13 @@ class FakeWebSocket extends EventTarget {
 	readyState = FakeWebSocket.OPEN;
 	binaryType = "arraybuffer";
 	sent: string[] = [];
+	readonly url: string;
+	readonly headers: Record<string, string>;
 
-	constructor(_url: string, _options?: unknown) {
+	constructor(url: string, options?: { headers?: Record<string, string> }) {
 		super();
+		this.url = url;
+		this.headers = options?.headers ?? {};
 		FakeWebSocket.instances.push(this);
 		queueMicrotask(() => {
 			if (FakeWebSocket.failHandshakes > 0) {
@@ -99,15 +103,71 @@ const context: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: 1 }],
 };
 
-function runStream(options: SimpleStreamOptions) {
-	return streamOverWebSocket(model, context, options, {
+function runStream(options: SimpleStreamOptions, selectedModel: Model<Api> = model) {
+	return streamOverWebSocket(selectedModel, context, options, {
 		stats: createStats(),
-		settings: { providers: [model.provider], transport: "websocket", connectTimeoutMs: 1_000 },
+		settings: { providers: [selectedModel.provider], transport: "websocket", connectTimeoutMs: 1_000 },
 		warnFallback: () => {},
 		pool: new SocketPool(),
 		stickySseSessions: new StickySseSessions(),
 	});
 }
+
+test("Pi 0.84 sampling parameters reach response.create with request values winning", async (t) => {
+	useFakeWebSocket(t);
+	const sampledModel: Model<Api> = {
+		...model,
+		samplingParams: { top_p: 0.9, top_k: 40, model_extension: { mode: "model" } },
+	};
+
+	const message = await runStream(
+		{
+			apiKey: "secret",
+			transport: "websocket",
+			samplingParams: { top_p: 0.5, min_p: 0.1, request_extension: ["kept"] },
+		},
+		sampledModel,
+	).result();
+
+	assert.equal(message.stopReason, "stop", message.errorMessage);
+	const sent = JSON.parse(FakeWebSocket.instances[0]!.sent[0]!) as Record<string, unknown>;
+	assert.equal(sent.top_p, 0.5, "request sampling parameters override model defaults");
+	assert.equal(sent.top_k, 40);
+	assert.equal(sent.min_p, 0.1);
+	assert.deepEqual(sent.model_extension, { mode: "model" });
+	assert.deepEqual(sent.request_extension, ["kept"], "arbitrary sampling keys stay intact");
+});
+
+test("Pi 0.84 removes nullable provider headers before the resolved handshake", async (t) => {
+	useFakeWebSocket(t);
+	const resolvedModel: Model<Api> = {
+		...model,
+		baseUrl: "https://resolved.example/v9",
+		headers: { "X-Provider-Default": "delete-me", "X-Provider-Keep": "kept" },
+	};
+
+	const message = await runStream(
+		{
+			apiKey: "resolved-credential",
+			headers: { "x-provider-default": null, "X-Route": "account-a" },
+			transport: "websocket",
+		},
+		resolvedModel,
+	).result();
+
+	assert.equal(message.stopReason, "stop", message.errorMessage);
+	const socket = FakeWebSocket.instances[0]!;
+	assert.equal(socket.url, "wss://resolved.example/v9/responses");
+	assert.equal(socket.headers.authorization, "Bearer resolved-credential");
+	assert.equal(socket.headers["x-provider-keep"], "kept");
+	assert.equal(socket.headers["x-route"], "account-a");
+	assert.equal(
+		Object.keys(socket.headers).some((key) => key.toLowerCase() === "x-provider-default"),
+		false,
+		"the SDK applies null deletion before invoking the injected fetch",
+	);
+	assert.equal(Object.values(socket.headers).includes("null"), false);
+});
 
 test("injects the WebSocket transport without replacing the caller fetch", async (t) => {
 	const originalFetch = globalThis.fetch;

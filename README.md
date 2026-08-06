@@ -10,7 +10,7 @@ while retaining HTTP/SSE when an endpoint cannot use it. The core request and ev
 
 ## Install
 
-Requires pi 0.83.0 or newer.
+Requires pi and pi-ai 0.84.0 or newer.
 
 ```
 pi install git:github.com/angribot/pi-openai-websocket
@@ -48,8 +48,9 @@ parameters.
 
 ## How it works
 
-Pi-ai 0.83 passes a per-request `fetch` to the OpenAI SDK. The extension supplies one that speaks
-WebSocket, without changing `globalThis.fetch`. Other providers, other extensions and pi's own traffic are
+Pi-ai 0.84 passes a per-request `fetch` to the OpenAI SDK after resolving the request's endpoint,
+credentials, headers and sampling parameters. The extension supplies a fetch that speaks WebSocket,
+without changing `globalThis.fetch`. Other providers, other extensions and pi's own traffic are
 untouched. If WebSocket is unavailable, the request is delegated unchanged to the fetch supplied by the
 caller, or to `globalThis.fetch` when no custom fetch was supplied.
 
@@ -113,7 +114,9 @@ Anything uncertain sends the full input, which is always correct and merely more
 ## Development
 
 ```
+npm ci                                        # installs the pinned Pi 0.84 development baseline
 npm test                                      # unit tests, no credentials
+npm run typecheck                             # TypeScript contract check
 node src/smoke.ts <provider> <model>          # one real turn
 node src/smoke-continuation.ts <provider>     # three real turns, reports delta vs full
 ```
