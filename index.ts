@@ -153,9 +153,9 @@ export function streamOverWebSocket(
 		return responsesApi.streamSimple(model, context, options);
 	}
 
-	// Continuation needs a socket that survives between turns, so "websocket" without
-	// caching gets a fresh connection each time and always sends the full input.
-	const pooled = transport !== "websocket";
+	// Reuse is safe only inside a named session and only for the caching modes.
+	// Everything else gets a fresh connection and therefore sends the full input.
+	const reusable = Boolean(sessionId) && (transport === "auto" || transport === "websocket-cached");
 	let pending: Continuation | undefined;
 
 	const { fetch: wsFetch, sawRequest } = createWsFetch({
@@ -164,19 +164,22 @@ export function streamOverWebSocket(
 		idleTimeoutMs: options?.timeoutMs,
 		signal: options?.signal,
 		stats: deps.stats,
-		unsupportedScope: model.provider,
 		onFallback: deps.warnFallback,
 		onTransportUnavailable: ({ phase, reason }) => {
 			if (!sessionId) return;
 			deps.stickySseSessions.markSseOnly(sessionId);
 			if (phase === "after-stream-start") deps.warnFallback(reason);
 		},
-		...(pooled
+		...(reusable && sessionId
 			? {
-					pool: deps.pool,
-					poolKey: `${options?.sessionId ?? "no-session"}:${model.provider}:${model.id}`,
-					onContinuation: (record) => {
-						pending = record;
+					reuse: {
+						pool: deps.pool,
+						sessionId,
+						provider: model.provider,
+						model: model.id,
+						onContinuation: (record: Continuation) => {
+							pending = record;
+						},
 					},
 				}
 			: {}),

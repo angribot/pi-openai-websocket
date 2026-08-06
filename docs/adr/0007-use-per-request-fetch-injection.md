@@ -1,6 +1,6 @@
 # ADR 0007: Use pi-ai's per-request fetch injection
 
-Status: accepted
+Status: accepted; minimum-version decision superseded by ADR 0008
 Date: 2026-07-30
 Supersedes: ADR 0002
 

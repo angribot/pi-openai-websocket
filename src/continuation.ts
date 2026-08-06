@@ -37,7 +37,7 @@ export interface Continuation {
 }
 
 export interface PooledSocket {
-	/** Pool bucket this socket belongs to, so releasing it needs no second argument. */
+	/** Opaque pool bucket this socket belongs to, so releasing it needs no second argument. */
 	key: string;
 	socket: WebSocket;
 	/** Wall clock at handshake, for the connection age cap. */

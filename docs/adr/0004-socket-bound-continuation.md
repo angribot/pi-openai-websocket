@@ -1,6 +1,6 @@
 # ADR 0004: Bind continuation state to the socket
 
-Status: accepted
+Status: accepted; pooling eligibility superseded by ADR 0008
 Date: 2026-07-25
 
 ## Context

@@ -103,15 +103,78 @@ const context: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: 1 }],
 };
 
-function runStream(options: SimpleStreamOptions, selectedModel: Model<Api> = model) {
-	return streamOverWebSocket(selectedModel, context, options, {
+function streamDeps(
+	selectedModel: Model<Api> = model,
+	transport: "auto" | "sse" | "websocket" | "websocket-cached" = "websocket",
+) {
+	return {
 		stats: createStats(),
-		settings: { providers: [selectedModel.provider], transport: "websocket", connectTimeoutMs: 1_000 },
+		settings: { providers: [selectedModel.provider], transport, connectTimeoutMs: 1_000 },
 		warnFallback: () => {},
 		pool: new SocketPool(),
 		stickySseSessions: new StickySseSessions(),
-	});
+	};
 }
+
+function runStream(options: SimpleStreamOptions, selectedModel: Model<Api> = model) {
+	return streamOverWebSocket(selectedModel, context, options, streamDeps(selectedModel));
+}
+
+test("requests without a session never reuse a cached WebSocket", async (t) => {
+	useFakeWebSocket(t);
+	const deps = streamDeps(model, "websocket-cached");
+	t.after(() => deps.pool.closeAll());
+
+	await streamOverWebSocket(model, context, { apiKey: "secret", transport: "websocket-cached" }, deps).result();
+	await streamOverWebSocket(model, context, { apiKey: "secret", transport: "websocket-cached" }, deps).result();
+
+	assert.equal(FakeWebSocket.instances.length, 2);
+	for (const socket of FakeWebSocket.instances) {
+		assert.equal(JSON.parse(socket.sent[0]!).previous_response_id, undefined);
+	}
+});
+
+test("explicit websocket transport opens a fresh connection for a named session", async (t) => {
+	useFakeWebSocket(t);
+	const deps = streamDeps(model, "websocket");
+	t.after(() => deps.pool.closeAll());
+	const options = { apiKey: "secret", transport: "websocket" as const, sessionId: "session-a" };
+
+	await streamOverWebSocket(model, context, options, deps).result();
+	await streamOverWebSocket(model, context, options, deps).result();
+
+	assert.equal(FakeWebSocket.instances.length, 2);
+	for (const socket of FakeWebSocket.instances) {
+		assert.equal(JSON.parse(socket.sent[0]!).previous_response_id, undefined);
+	}
+});
+
+test("equivalent cached requests in one named session reuse a WebSocket", async (t) => {
+	useFakeWebSocket(t);
+	const deps = streamDeps(model, "websocket-cached");
+	t.after(() => deps.pool.closeAll());
+	const options = { apiKey: "secret", transport: "websocket-cached" as const, sessionId: "session-a" };
+
+	await streamOverWebSocket(model, context, options, deps).result();
+	await streamOverWebSocket(model, context, options, deps).result();
+
+	assert.equal(FakeWebSocket.instances.length, 1);
+	assert.equal(deps.stats.connectionsReused, 1);
+});
+
+test("a credential change in one named session opens a new WebSocket", async (t) => {
+	useFakeWebSocket(t);
+	const deps = streamDeps(model, "websocket-cached");
+	t.after(() => deps.pool.closeAll());
+	const options = { transport: "websocket-cached" as const, sessionId: "session-a" };
+
+	await streamOverWebSocket(model, context, { ...options, apiKey: "first-credential" }, deps).result();
+	await streamOverWebSocket(model, context, { ...options, apiKey: "second-credential" }, deps).result();
+
+	assert.equal(FakeWebSocket.instances.length, 2);
+	assert.equal(FakeWebSocket.instances[0]!.headers.authorization, "Bearer first-credential");
+	assert.equal(FakeWebSocket.instances[1]!.headers.authorization, "Bearer second-credential");
+});
 
 test("Pi 0.84 sampling parameters reach response.create with request values winning", async (t) => {
 	useFakeWebSocket(t);
