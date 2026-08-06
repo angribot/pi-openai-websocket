@@ -121,7 +121,7 @@ Anything uncertain also sends the full input, which is always correct and merely
 ## Development
 
 ```
-npm ci                                        # installs the pinned Pi 0.84 development baseline
+npm install                                   # installs the exact Pi 0.84 direct development baseline
 npm test                                      # unit tests, no credentials
 npm run typecheck                             # TypeScript contract check
 node src/smoke.ts <provider> <model>          # one real turn
