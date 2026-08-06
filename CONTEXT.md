@@ -24,10 +24,13 @@ checked out. A busy socket is dropped only once it is past the age limit, since 
 legitimately busy for minutes. The timer starts with the first socket, stops when the pool empties, and is
 unreferenced so it never holds the process open.
 
-**Continuation** — the state that lets the next request send only new input items and reference the
-previous response by `previous_response_id`: the previous full-input request body, its response id, and the
-items that response produced. Held on a pooled socket, never in a map keyed by session or model, because
-some relays ignore the id and answer from whatever that connection produced last.
+**Connection identity** — the endpoint and effective handshake metadata that identify the remote account
+and route a WebSocket belongs to. Reusable connection state never crosses connection identities.
+
+**Continuation** — the state that lets the next request in a named session send only new input items and
+reference the previous response by `previous_response_id`: the previous full-input request body, its
+response id, and the items that response produced. Held on a pooled socket, never shared between sockets,
+because some relays ignore the id and answer from whatever that connection produced last.
 
 **Delta** — a request carrying `previous_response_id` and only the input items the server has not seen.
 The opposite is a **full request**, which carries the whole conversation. A delta is only sent when the
@@ -44,7 +47,7 @@ socket, once.
 
 **Strip-and-retry** — dropping a request parameter the endpoint named as unsupported and resending. Relays
 forwarding to a Codex-style backend accept a narrower parameter set over WebSocket than over HTTP.
-Rejections are remembered per provider for the rest of the process.
+Rejections are remembered only for the same connection identity and request model.
 
 **Terminal event** — `response.completed`, `response.incomplete` or `response.failed`. Ends a response but
 not the socket. A close or EOF before one is an error.

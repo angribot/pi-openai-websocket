@@ -16,6 +16,7 @@
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+import { createHash } from "node:crypto";
 import {
 	applyContinuation,
 	closeQuietly,
@@ -83,26 +84,21 @@ export interface WsFetchOptions {
 	/** Called when WebSocket transport fails, so later requests can prefer SSE. */
 	onTransportUnavailable?: (failure: WsTransportUnavailable) => void;
 	/**
-	 * Scope for remembering parameters the endpoint rejects, normally the provider
-	 * name. Relays that forward to a Codex-style backend accept a narrower parameter
-	 * set over WebSocket than over HTTP, and they name the offending field in the
-	 * error, so it can be dropped and the request retried.
+	 * Named-session socket reuse. Without this every request opens and closes its own
+	 * connection and always sends the full input.
 	 */
-	unsupportedScope?: string;
-	/**
-	 * Socket pool. Supplying one enables `previous_response_id` continuation, whose
-	 * state is bound to the socket. Without a pool every request opens and closes its
-	 * own connection and always sends the full input.
-	 */
-	pool?: SocketPool;
-	/** Pool bucket, normally session + provider + model. */
-	poolKey?: string;
-	/**
-	 * Called when a response completes, with the continuation record held by the
-	 * socket. The caller fills in `responseItems` from the finished assistant message
-	 * and flips `complete`, which is what allows the next request to send a delta.
-	 */
-	onContinuation?: (continuation: Continuation) => void;
+	reuse?: {
+		pool: SocketPool;
+		sessionId: string;
+		provider: string;
+		model: string;
+		/**
+		 * Called when a response completes, with the continuation record held by the
+		 * socket. The caller fills in `responseItems` from the finished assistant
+		 * message and flips `complete`, enabling the next request to send a delta.
+		 */
+		onContinuation?: (continuation: Continuation) => void;
+	};
 }
 
 export interface WsTransportUnavailable {
@@ -113,17 +109,13 @@ export interface WsTransportUnavailable {
 /** Frames that end a response. */
 const TERMINAL_TYPES = new Set(["response.completed", "response.incomplete", "response.failed"]);
 
-/** Parameters a given endpoint has rejected, keyed by scope. Lives for the process. */
+/** Parameters rejected by a connection identity and request model. Lives for the process. */
 const unsupportedParams = new Map<string, Set<string>>();
 
 /** Ceiling on strip-and-retry rounds, so a misbehaving endpoint cannot spin. */
 const MAX_STRIP_ROUNDS = 4;
 
-export function knownUnsupportedParams(scope: string): string[] {
-	return [...(unsupportedParams.get(scope) ?? [])];
-}
-
-/** Every parameter any endpoint has rejected. `stats` spans providers, so this must too. */
+/** Every parameter any endpoint has rejected. `stats` spans identities, so this must too. */
 function allUnsupportedParams(): string[] {
 	const all = new Set<string>();
 	for (const set of unsupportedParams.values()) for (const name of set) all.add(name);
@@ -165,6 +157,7 @@ function isConnectionLimit(frame: Record<string, unknown>): boolean {
 }
 
 const BETA_HEADER = "OpenAI-Beta";
+const BETA_HEADER_LOWER = BETA_HEADER.toLowerCase();
 const BETA_VALUE = "responses_websockets=2026-02-06";
 const WEBSOCKET_DROPPED_BODY_FIELDS = new Set(["stream"]);
 
@@ -218,16 +211,27 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 
 		const wsUrl = toWebSocketUrl(url);
 		const headers = headerRecord(init.headers);
-		const scope = options.unsupportedScope ?? new URL(wsUrl).host;
-		const rejected = unsupportedParams.get(scope) ?? new Set<string>();
-		unsupportedParams.set(scope, rejected);
-		const poolKey = options.poolKey ?? scope;
+		const connectionIdentity = identityDigest(["connection", wsUrl, canonicalHeaderEntries(headers)]);
+		const unsupportedKey = identityDigest(["unsupported", connectionIdentity, websocketBody.model]);
+		const rejected = unsupportedParams.get(unsupportedKey) ?? new Set<string>();
+		unsupportedParams.set(unsupportedKey, rejected);
+		const reuse = options.reuse?.sessionId ? options.reuse : undefined;
+		const poolKey = reuse
+			? identityDigest([
+					"pool",
+					reuse.sessionId,
+					reuse.provider,
+					reuse.model,
+					websocketBody.model,
+					connectionIdentity,
+				])
+			: connectionIdentity;
 
 		let entry: PooledSocket | undefined;
 		/** Ends an attempt. `keep` pools the socket; otherwise it is closed. */
 		const finish = (target: PooledSocket, keep: boolean) => {
 			if (entry === target) entry = undefined;
-			if (options.pool) options.pool.release(target, keep);
+			if (reuse) reuse.pool.release(target, keep);
 			else closeQuietly(target.socket);
 		};
 
@@ -239,7 +243,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 		try {
 			for (;;) {
 				if (!entry) {
-					entry = forceFreshSocket ? undefined : options.pool?.acquire(poolKey);
+					entry = forceFreshSocket ? undefined : reuse?.pool.acquire(poolKey);
 					forceFreshSocket = false;
 					if (entry) {
 						options.stats.connectionsReused++;
@@ -251,7 +255,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 							return fallbackUnavailable(errorText(error));
 						}
 						options.stats.connected++;
-						entry = options.pool?.add(poolKey, socket) ?? unpooledEntry(poolKey, socket);
+						entry = reuse?.pool.add(poolKey, socket) ?? unpooledEntry(poolKey, socket);
 					}
 				}
 				const attempt = entry;
@@ -279,7 +283,7 @@ export function createWsFetch(options: WsFetchOptions): { fetch: FetchLike; sawR
 					// request's input has to extend.
 					const record: Continuation = { requestBody: prepared, responseId, responseItems: [], complete: false };
 					attempt.continuation = record;
-					options.onContinuation?.(record);
+					reuse?.onContinuation?.(record);
 				});
 				let first: IteratorResult<Record<string, unknown>>;
 				try {
@@ -411,7 +415,7 @@ export function toWebSocketUrl(httpUrl: string): string {
 
 /** Headers for the WebSocket handshake, including the fixed current protocol opt-in. */
 export function headerRecord(headers: RequestInit["headers"]): Record<string, string> {
-	const out = filterHeaders(headers, (key) => !DROPPED_HEADERS.has(key) && key !== "openai-beta");
+	const out = filterHeaders(headers, (key) => !DROPPED_HEADERS.has(key) && key !== BETA_HEADER_LOWER);
 	out[BETA_HEADER] = BETA_VALUE;
 	return out;
 }
@@ -426,6 +430,16 @@ function filterHeaders(headers: RequestInit["headers"], keep: (lowerKey: string)
 	else if (Array.isArray(headers)) for (const [key, value] of headers) add(key, value);
 	else for (const [key, value] of Object.entries(headers)) add(key, String(value));
 	return out;
+}
+
+function canonicalHeaderEntries(headers: Record<string, string>): [string, string][] {
+	const canonical = new Map<string, string>();
+	for (const [key, value] of Object.entries(headers)) canonical.set(key.toLowerCase(), value);
+	return [...canonical.entries()].sort(([left], [right]) => left.localeCompare(right));
+}
+
+function identityDigest(parts: unknown[]): string {
+	return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
 async function connect(

@@ -4,20 +4,40 @@
   "description": "WebSocket transport for the OpenAI Responses API in pi, for any third-party provider",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi-extension", "openai", "responses", "websocket"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "openai",
+    "responses",
+    "websocket"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/angribot/pi-openai-websocket.git"
   },
-  "files": ["index.ts", "src", "README.md", "LICENSE"],
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
-    "test": "node --test src/*.test.ts"
+    "test": "node --test src/*.test.ts",
+    "typecheck": "tsc"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": ">=0.84.0",
+    "@earendil-works/pi-coding-agent": ">=0.84.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.0",
+    "@earendil-works/pi-coding-agent": "0.84.0",
+    "@types/node": "24.12.4",
+    "typescript": "7.0.2"
   }
 }

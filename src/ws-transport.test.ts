@@ -3,12 +3,13 @@ import test from "node:test";
 import {
 	createStats,
 	createWsFetch,
+	formatStats,
 	headerRecord,
 	isStaleContinuation,
-	knownUnsupportedParams,
 	resetUnsupportedParams,
 	toWebSocketUrl,
 	unsupportedParamFrom,
+	type WsFetchOptions,
 } from "./ws-transport.ts";
 import { SocketPool } from "./continuation.ts";
 
@@ -108,6 +109,43 @@ function noFallback(): FetchLike {
 	};
 }
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+type ReuseOptions = NonNullable<WsFetchOptions["reuse"]>;
+
+function reuseOptions(
+	pool: SocketPool,
+	overrides: Partial<Omit<ReuseOptions, "pool">> = {},
+): ReuseOptions {
+	return {
+		pool,
+		sessionId: "session-a",
+		provider: "test-provider",
+		model: "m",
+		...overrides,
+	};
+}
+
+interface CompleteRequestOptions {
+	url?: string;
+	body?: Record<string, unknown>;
+	headers?: Record<string, string>;
+	reuse?: ReuseOptions;
+	stats?: ReturnType<typeof createStats>;
+}
+
+async function completeRequest(options: CompleteRequestOptions): Promise<void> {
+	const { fetch: wsFetch } = createWsFetch({
+		fallbackFetch: noFallback(),
+		connectTimeoutMs: 1000,
+		stats: options.stats ?? createStats(),
+		reuse: options.reuse,
+	});
+	const response = await wsFetch(
+		options.url ?? "https://api.example.com/v1/responses",
+		requestInit(options.body ?? { model: "m", input: [] }, options.headers),
+	);
+	assert.equal(response.status, 200);
+	await response.text();
+}
 
 test("url and header handling", () => {
 	assert.equal(toWebSocketUrl("https://api.example.com/v1/responses"), "wss://api.example.com/v1/responses");
@@ -218,9 +256,7 @@ test("continuation state is recorded from the terminal event", async () => {
 		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
-		pool: new SocketPool(),
-		poolKey: "k",
-		onContinuation: (record) => records.push(record),
+		reuse: reuseOptions(new SocketPool(), { onContinuation: (record) => records.push(record) }),
 	});
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m", input: [] }));
 	await response.text();
@@ -228,6 +264,106 @@ test("continuation state is recorded from the terminal event", async () => {
 	assert.deepEqual(records, [
 		{ requestBody: { model: "m", input: [] }, responseId: "resp_1", responseItems: [], complete: false },
 	]);
+});
+
+test("header order and casing share one opaque connection identity", async () => {
+	useFakeSocket([COMPLETED]);
+	const pool = new SocketPool();
+	const stats = createStats();
+	const reuse = reuseOptions(pool, { sessionId: "private-session" });
+
+	await completeRequest({
+		headers: { Authorization: "Bearer private-credential", "X-Route": "private-route" },
+		reuse,
+		stats,
+	});
+	await completeRequest({
+		headers: { "x-route": "private-route", authorization: "Bearer private-credential" },
+		reuse,
+		stats,
+	});
+
+	assert.equal(FakeWebSocket.instances.length, 1);
+	assert.equal(stats.connectionsReused, 1);
+	const entries = (pool as unknown as { entries: Map<string, unknown> }).entries;
+	const keys = [...entries.keys()];
+	assert.equal(keys.length, 1);
+	assert.match(keys[0]!, /^[a-f0-9]{64}$/, "pool keys expose only an opaque SHA-256 digest");
+	for (const secret of ["private-session", "private-credential", "private-route", "api.example.com"]) {
+		assert.equal(keys[0]!.includes(secret), false);
+		assert.equal(JSON.stringify(stats).includes(secret), false);
+		assert.equal(formatStats(stats).includes(secret), false);
+	}
+	pool.closeAll();
+});
+
+test("endpoint changes do not share pooled sockets", async () => {
+	useFakeSocket([COMPLETED]);
+	const pool = new SocketPool();
+	const reuse = reuseOptions(pool);
+
+	await completeRequest({ url: "https://first.example/v1/responses", reuse });
+	await completeRequest({ url: "https://second.example/v1/responses", reuse });
+
+	assert.equal(FakeWebSocket.instances.length, 2);
+	pool.closeAll();
+});
+
+test("authentication and routing header changes do not share pooled sockets", async (t) => {
+	for (const scenario of [
+		{
+			name: "credential",
+			first: { authorization: "Bearer first", "x-route": "route" },
+			second: { authorization: "Bearer second", "x-route": "route" },
+		},
+		{
+			name: "route",
+			first: { authorization: "Bearer secret", "x-route": "first" },
+			second: { authorization: "Bearer secret", "x-route": "second" },
+		},
+	]) {
+		await t.test(scenario.name, async () => {
+			useFakeSocket([COMPLETED]);
+			const pool = new SocketPool();
+			const reuse = reuseOptions(pool);
+
+			await completeRequest({ headers: scenario.first, reuse });
+			await completeRequest({ headers: scenario.second, reuse });
+
+			assert.equal(FakeWebSocket.instances.length, 2);
+			pool.closeAll();
+		});
+	}
+});
+
+test("model and session changes do not share pooled sockets", async (t) => {
+	for (const scenario of [
+		{
+			name: "request model",
+			firstReuse: {},
+			secondReuse: {},
+			firstBody: { model: "model-a", input: [] },
+			secondBody: { model: "model-b", input: [] },
+		},
+		{
+			name: "session",
+			firstReuse: { sessionId: "session-a" },
+			secondReuse: { sessionId: "session-b" },
+			firstBody: { model: "m", input: [] },
+			secondBody: { model: "m", input: [] },
+		},
+	]) {
+		await t.test(scenario.name, async () => {
+			useFakeSocket([COMPLETED]);
+			const pool = new SocketPool();
+
+			await completeRequest({ body: scenario.firstBody, reuse: reuseOptions(pool, scenario.firstReuse) });
+			await completeRequest({ body: scenario.secondBody, reuse: reuseOptions(pool, scenario.secondReuse) });
+
+			assert.equal(FakeWebSocket.instances.length, 2);
+			pool.closeAll();
+		});
+	}
 });
 
 test("a wrapped error frame becomes an HTTP error response", async () => {
@@ -465,27 +601,29 @@ test("a stale continuation retry does not consume the strip budget", async () =>
 	// stripping up to MAX_STRIP_ROUNDS.
 	const stale = { type: "error", status: 400, error: { code: "previous_response_not_found" } };
 	const reject = (param: string) => ({ type: "error", status: 400, error: { message: `Unsupported parameter: ${param}` } });
-	useFakeSocketTurns([[stale], [reject("p1")], [reject("p2")], [reject("p3")], [reject("p4")], [COMPLETED]]);
+	useFakeSocketTurns([
+		[COMPLETED],
+		[stale],
+		[reject("p1")],
+		[reject("p2")],
+		[reject("p3")],
+		[reject("p4")],
+		[COMPLETED],
+	]);
 
 	const pool = new SocketPool();
-	const stats = createStats();
-	const { fetch: wsFetch } = createWsFetch({
-		fallbackFetch: noFallback(),
-		connectTimeoutMs: 1000,
-		stats,
-		pool,
-		poolKey: "budget",
+	const reuse = reuseOptions(pool, {
+		onContinuation: (record) => {
+			record.responseItems = [{ role: "assistant" }];
+			record.complete = true;
+		},
 	});
+	const firstBody = { model: "m", input: [{ role: "user" }] };
+	const seed = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats(), reuse });
+	await (await seed.fetch("https://api.example.com/v1/responses", requestInit(firstBody))).text();
 
-	const seeded = pool.add("budget", new FakeWebSocket("wss://api.example.com/v1/responses") as unknown as WebSocket);
-	seeded.continuation = {
-		requestBody: { model: "m", input: [{ role: "user" }] },
-		responseId: "resp_0",
-		responseItems: [{ role: "assistant" }],
-		complete: true,
-	};
-	pool.release(seeded, true);
-
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats, reuse });
 	const response = await wsFetch(
 		"https://api.example.com/v1/responses",
 		requestInit({ model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] }),
@@ -507,8 +645,7 @@ test("cancelling the response body releases the socket", async () => {
 		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
-		pool,
-		poolKey: "cancelled",
+		reuse: reuseOptions(pool),
 	});
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));
@@ -517,45 +654,37 @@ test("cancelling the response body releases the socket", async () => {
 	await reader.cancel();
 
 	assert.equal(pool.size, 0, "an incomplete response leaves the server side unknown, so the socket goes");
-	assert.equal(pool.acquire("cancelled"), undefined);
 });
 
 test("a rejected previous_response_id resends the full input on the same socket", async () => {
 	// The server no longer holds the response the delta chained onto. Nothing has
 	// streamed, so resending whole is safe, and it must not surface as an error.
 	const stale = { type: "error", status: 400, error: { code: "previous_response_not_found" } };
-	useFakeSocketTurns([[stale], [COMPLETED]]);
+	useFakeSocketTurns([[COMPLETED], [stale], [COMPLETED]]);
 
 	const pool = new SocketPool();
-	const stats = createStats();
-	const { fetch: wsFetch } = createWsFetch({
-		fallbackFetch: noFallback(),
-		connectTimeoutMs: 1000,
-		stats,
-		pool,
-		poolKey: "stale-key",
+	const reuse = reuseOptions(pool, {
+		onContinuation: (record) => {
+			record.responseItems = [{ role: "assistant" }];
+			record.complete = true;
+		},
 	});
+	const firstBody = { model: "m", input: [{ role: "user" }] };
+	const seed = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats(), reuse });
+	await (await seed.fetch("https://api.example.com/v1/responses", requestInit(firstBody))).text();
 
-	// Seed a socket that believes it can continue from resp_0.
-	const seeded = pool.add("stale-key", new FakeWebSocket("wss://api.example.com/v1/responses") as unknown as WebSocket);
-	seeded.continuation = {
-		requestBody: { model: "m", input: [{ role: "user" }] },
-		responseId: "resp_0",
-		responseItems: [{ role: "assistant" }],
-		complete: true,
-	};
-	pool.release(seeded, true);
-
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats, reuse });
 	const full = { model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] };
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit(full));
 
 	assert.equal(response.status, 200, "the recovery is invisible to the caller");
 	assert.deepEqual(await readSse(response), [COMPLETED]);
 
-	const sent = seeded.socket as unknown as FakeWebSocket;
-	assert.equal(sent.sent.length, 2, "both attempts went out on the one socket");
-	assert.equal(JSON.parse(sent.sent[0]!).previous_response_id, "resp_0", "first attempt was a delta");
-	assert.deepEqual(JSON.parse(sent.sent[1]!), { type: "response.create", ...full }, "retry sent everything");
+	const sent = FakeWebSocket.instances[0]!;
+	assert.equal(sent.sent.length, 3, "the seed and both attempts went out on the one socket");
+	assert.equal(JSON.parse(sent.sent[1]!).previous_response_id, "resp_1", "first attempt was a delta");
+	assert.deepEqual(JSON.parse(sent.sent[2]!), { type: "response.create", ...full }, "retry sent everything");
 	assert.equal(stats.staleContinuations, 1);
 	assert.equal(stats.fullRequests, 1);
 	assert.equal(stats.deltaRequests, 0, "the abandoned delta is not counted as sent");
@@ -578,30 +707,25 @@ test("a stale continuation is recognised in either shape", () => {
 
 test("a second stale rejection is surfaced instead of retried forever", async () => {
 	const stale = { type: "error", status: 400, error: { code: "previous_response_not_found" } };
-	useFakeSocketTurns([[stale], [stale]]);
+	useFakeSocketTurns([[COMPLETED], [stale], [stale]]);
 
 	const pool = new SocketPool();
-	const stats = createStats();
-	const { fetch: wsFetch } = createWsFetch({
-		fallbackFetch: noFallback(),
-		connectTimeoutMs: 1000,
-		stats,
-		pool,
-		poolKey: "stubborn-stale",
+	const reuse = reuseOptions(pool, {
+		onContinuation: (record) => {
+			record.responseItems = [{ role: "assistant" }];
+			record.complete = true;
+		},
 	});
+	const seed = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats: createStats(), reuse });
+	await (
+		await seed.fetch(
+			"https://api.example.com/v1/responses",
+			requestInit({ model: "m", input: [{ role: "user" }] }),
+		)
+	).text();
 
-	const seeded = pool.add(
-		"stubborn-stale",
-		new FakeWebSocket("wss://api.example.com/v1/responses") as unknown as WebSocket,
-	);
-	seeded.continuation = {
-		requestBody: { model: "m", input: [{ role: "user" }] },
-		responseId: "resp_0",
-		responseItems: [{ role: "assistant" }],
-		complete: true,
-	};
-	pool.release(seeded, true);
-
+	const stats = createStats();
+	const { fetch: wsFetch } = createWsFetch({ fallbackFetch: noFallback(), connectTimeoutMs: 1000, stats, reuse });
 	const response = await wsFetch(
 		"https://api.example.com/v1/responses",
 		requestInit({ model: "m", input: [{ role: "user" }, { role: "assistant" }, { role: "user" }] }),
@@ -638,7 +762,6 @@ test("a rejected parameter is dropped and the request retried", async () => {
 		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
-		unsupportedScope: "test-provider",
 	});
 
 	const response = await wsFetch(
@@ -666,7 +789,6 @@ test("a rejected parameter stays dropped for later requests", async () => {
 		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats,
-		unsupportedScope: "sticky-provider",
 	});
 	const body = { model: "m", input: [], max_output_tokens: 4096 };
 
@@ -675,7 +797,50 @@ test("a rejected parameter stays dropped for later requests", async () => {
 
 	assert.equal(FakeWebSocket.instances.length, 3, "the second request must not re-learn the rejection");
 	assert.equal(JSON.parse(FakeWebSocket.instances[2]!.sent[0]!).max_output_tokens, undefined);
-	assert.deepEqual(knownUnsupportedParams("sticky-provider"), ["max_output_tokens"]);
+});
+
+test("unsupported-parameter learning is isolated by connection identity and request model", async (t) => {
+	const reject = { type: "error", status: 400, error: { message: "Unsupported parameter: max_output_tokens" } };
+	const scenarios: Array<{
+		name: string;
+		first: Pick<CompleteRequestOptions, "url" | "body" | "headers">;
+		second: Pick<CompleteRequestOptions, "url" | "body" | "headers">;
+	}> = [
+		{
+			name: "endpoint",
+			first: { url: "https://first.example/v1/responses" },
+			second: { url: "https://second.example/v1/responses" },
+		},
+		{
+			name: "credential",
+			first: { headers: { authorization: "Bearer first" } },
+			second: { headers: { authorization: "Bearer second" } },
+		},
+		{
+			name: "route",
+			first: { headers: { authorization: "Bearer secret", "x-route": "first" } },
+			second: { headers: { authorization: "Bearer secret", "x-route": "second" } },
+		},
+		{
+			name: "request model",
+			first: { body: { model: "model-a", input: [], max_output_tokens: 4096 } },
+			second: { body: { model: "model-b", input: [], max_output_tokens: 4096 } },
+		},
+	];
+
+	for (const scenario of scenarios) {
+		await t.test(scenario.name, async () => {
+			useFakeSocketTurns([[reject], [COMPLETED], [reject], [COMPLETED]]);
+			const defaultBody = { model: "m", input: [], max_output_tokens: 4096 };
+
+			await completeRequest({ body: defaultBody, ...scenario.first });
+			await completeRequest({ body: defaultBody, ...scenario.second });
+
+			assert.equal(FakeWebSocket.instances.length, 4, "the second identity learns the rejection independently");
+			const secondIdentityFirstAttempt = JSON.parse(FakeWebSocket.instances[2]!.sent[0]!);
+			assert.equal(secondIdentityFirstAttempt.max_output_tokens, 4096);
+		});
+	}
 });
 
 test("a persistent rejection eventually stops retrying", async () => {
@@ -688,7 +853,6 @@ test("a persistent rejection eventually stops retrying", async () => {
 		fallbackFetch: noFallback(),
 		connectTimeoutMs: 1000,
 		stats: createStats(),
-		unsupportedScope: "stubborn",
 	});
 
 	const response = await wsFetch("https://api.example.com/v1/responses", requestInit({ model: "m" }));

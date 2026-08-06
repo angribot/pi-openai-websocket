@@ -1,6 +1,6 @@
 # ADR 0005: Recover from endpoint rejections instead of surfacing them
 
-Status: accepted
+Status: accepted; per-provider learning scope superseded by ADR 0008
 Date: 2026-07-25
 
 ## Context

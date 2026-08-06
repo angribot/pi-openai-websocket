@@ -10,7 +10,7 @@ while retaining HTTP/SSE when an endpoint cannot use it. The core request and ev
 
 ## Install
 
-Requires pi 0.83.0 or newer.
+Requires pi and pi-ai 0.84.0 or newer.
 
 ```
 pi install git:github.com/angribot/pi-openai-websocket
@@ -37,8 +37,8 @@ Transport selection follows pi's own `transport` setting, so `/settings` still c
 |---|---|
 | `sse` | WebSocket disabled, unchanged HTTP streaming |
 | `websocket` | WebSocket, one connection per request, full input every time |
-| `websocket-cached` | WebSocket, pooled connections, `previous_response_id` deltas |
-| `auto` (default) | same as `websocket-cached` |
+| `websocket-cached` | Named sessions pool compatible connections and may send `previous_response_id` deltas; calls without a session use a fresh connection |
+| `auto` (default) | Same as `websocket-cached` |
 
 `websocketConnectTimeoutMs` bounds the handshake (default 15000, `0` disables). Stream idleness uses
 pi's `httpIdleTimeoutMs`.
@@ -48,14 +48,20 @@ parameters.
 
 ## How it works
 
-Pi-ai 0.83 passes a per-request `fetch` to the OpenAI SDK. The extension supplies one that speaks
-WebSocket, without changing `globalThis.fetch`. Other providers, other extensions and pi's own traffic are
+Pi-ai 0.84 passes a per-request `fetch` to the OpenAI SDK after resolving the request's endpoint,
+credentials, headers and sampling parameters. The extension supplies a fetch that speaks WebSocket,
+without changing `globalThis.fetch`. Other providers, other extensions and pi's own traffic are
 untouched. If WebSocket is unavailable, the request is delegated unchanged to the fetch supplied by the
 caller, or to `globalThis.fetch` when no custom fetch was supplied.
 
 Everything above the transport stays pi-ai's: request construction, retries, error formatting, usage
 accounting and abort handling. Frames are re-emitted as `text/event-stream` bytes so the SDK's own decoder
 parses them, which is why the event pipeline is shared rather than reimplemented.
+
+A pooled connection is reusable only within the same named session, provider and model, and only when the
+final WebSocket endpoint and effective handshake headers still identify the same account and route. The
+identity is stored as an opaque digest, so credentials and routing headers do not appear in pool keys or
+stats. Credential, endpoint or routing changes safely open a fresh connection.
 
 Every WebSocket handshake sends `OpenAI-Beta: responses_websockets=2026-02-06`. WebSocket frames omit the
 HTTP-only `stream` field; the original body remains intact for HTTP fallback. Requests with
@@ -71,8 +77,8 @@ without a session id do not share fallback state.
 
 Some relays forward to a Codex-style backend that accepts a narrower parameter set over WebSocket than
 over HTTP, and answer with `Unsupported parameter: <name>`. The named parameter is dropped, the request
-is retried on a fresh socket, and the rejection is remembered for the rest of the process. Observed on
-one relay: `max_output_tokens` and `prompt_cache_options`.
+is retried on a fresh socket, and the rejection is remembered only for that connection identity and
+request model. Observed on one relay: `max_output_tokens` and `prompt_cache_options`.
 
 If the endpoint rejects the `previous_response_id` a delta chained onto, usually
 `previous_response_not_found`, the continuation is forgotten and the conversation is resent whole on the
@@ -100,7 +106,9 @@ uses, not from the server's echo of its own output, because relays may report th
 loader does not expose that conversion to extensions, so it is obtained by letting pi-ai build a request
 body and capturing it from `onPayload`, which costs one body build and no network.
 
-Anything uncertain sends the full input, which is always correct and merely more expensive.
+Only named sessions using `auto` or `websocket-cached` can reuse a socket and send a delta. Calls without a
+session ID and calls using explicit `websocket` always open a fresh connection and send the full input.
+Anything uncertain also sends the full input, which is always correct and merely more expensive.
 
 ## Not covered
 
@@ -113,7 +121,9 @@ Anything uncertain sends the full input, which is always correct and merely more
 ## Development
 
 ```
+npm install                                   # installs the exact Pi 0.84 direct development baseline
 npm test                                      # unit tests, no credentials
+npm run typecheck                             # TypeScript contract check
 node src/smoke.ts <provider> <model>          # one real turn
 node src/smoke-continuation.ts <provider>     # three real turns, reports delta vs full
 ```
