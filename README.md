@@ -1,6 +1,6 @@
 # pi-openai-websocket
 
-WebSocket transport for the OpenAI Responses API in [pi](https://github.com/badlogic/pi-mono), for
+WebSocket transport for the OpenAI Responses API in [pi](https://github.com/earendil-works/pi), for
 opted-in third-party providers.
 
 pi ships WebSocket support only inside `openai-codex-responses`, a proprietary api third-party providers
@@ -121,7 +121,8 @@ Anything uncertain also sends the full input, which is always correct and merely
 ## Development
 
 ```
-npm install                                   # installs the exact Pi 0.84 direct development baseline
+npm install                                   # installs the exact pinned development dependencies
+npm run lint                                  # oxlint
 npm test                                      # unit tests, no credentials
 npm run typecheck                             # TypeScript contract check
 node src/smoke.ts <provider> <model>          # one real turn
