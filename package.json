@@ -38,7 +38,7 @@
   "devDependencies": {
     "@earendil-works/pi-ai": "0.84.3",
     "@earendil-works/pi-coding-agent": "0.84.3",
-    "@types/node": "24.12.4",
+    "@types/node": "26.3.0",
     "oxlint": "1.80.0",
     "typescript": "7.0.2"
   }

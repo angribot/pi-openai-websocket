@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
 import { StickySseSessions } from "./session-fallback.ts";
@@ -120,6 +120,10 @@ function runStream(options: SimpleStreamOptions, selectedModel: Model<Api> = mod
 	return streamOverWebSocket(selectedModel, context, options, streamDeps(selectedModel));
 }
 
+function assertStreamStoppedNormally(message: AssistantMessage): void {
+	assert.equal(message.stopReason, "stop", message.errorMessage ?? "stream did not stop normally");
+}
+
 test("requests without a session never reuse a cached WebSocket", async (t) => {
 	useFakeWebSocket(t);
 	const deps = streamDeps(model, "websocket-cached");
@@ -192,7 +196,7 @@ test("Pi 0.84 sampling parameters reach response.create with request values winn
 		sampledModel,
 	).result();
 
-	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assertStreamStoppedNormally(message);
 	const sent = JSON.parse(FakeWebSocket.instances[0]!.sent[0]!) as Record<string, unknown>;
 	assert.equal(sent.top_p, 0.5, "request sampling parameters override model defaults");
 	assert.equal(sent.top_k, 40);
@@ -218,7 +222,7 @@ test("Pi 0.84 removes nullable provider headers before the resolved handshake", 
 		resolvedModel,
 	).result();
 
-	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assertStreamStoppedNormally(message);
 	const socket = FakeWebSocket.instances[0]!;
 	assert.equal(socket.url, "wss://resolved.example/v9/responses");
 	assert.equal(socket.headers.authorization, "Bearer resolved-credential");
@@ -245,7 +249,7 @@ test("injects the WebSocket transport without replacing the caller fetch", async
 	assert.equal(globalThis.fetch, originalFetch, "global fetch stays unchanged while the stream is active");
 
 	const message = await stream.result();
-	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assertStreamStoppedNormally(message);
 	assert.equal(callerFetches, 0);
 	assert.equal(FakeWebSocket.instances.length, 1);
 	assert.equal(globalThis.fetch, originalFetch);
@@ -267,7 +271,7 @@ test("uses global fetch for fallback when the caller does not supply one", async
 
 	const message = await runStream({ apiKey: "secret", transport: "websocket" }).result();
 
-	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assertStreamStoppedNormally(message);
 	assert.equal(globalFetches, 1);
 	assert.equal(String(delegatedInput), "https://api.example.com/v1/responses");
 	assert.equal(FakeWebSocket.instances.length, 1);
@@ -294,7 +298,7 @@ test("keeps pi-ai retries on caller fetch after WebSocket becomes unavailable", 
 		maxRetries: 1,
 	}).result();
 
-	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assertStreamStoppedNormally(message);
 	assert.equal(callerFetches, 2);
 	assert.equal(FakeWebSocket.instances.length, 1);
 });
@@ -326,7 +330,7 @@ test("keeps pi-ai retries on WebSocket after a provider HTTP error", async (t) =
 		maxRetries: 1,
 	}).result();
 
-	assert.equal(message.stopReason, "stop", message.errorMessage);
+	assertStreamStoppedNormally(message);
 	assert.equal(callerFetches, 0);
 	assert.equal(FakeWebSocket.instances.length, 2);
 });
