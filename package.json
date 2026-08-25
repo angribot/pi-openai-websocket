@@ -27,17 +27,19 @@
     ]
   },
   "scripts": {
+    "lint": "oxlint --deny-warnings .",
     "test": "node --test src/*.test.ts",
     "typecheck": "tsc"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.84.0",
-    "@earendil-works/pi-coding-agent": ">=0.84.0"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.0",
-    "@earendil-works/pi-coding-agent": "0.84.0",
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
     "@types/node": "24.12.4",
+    "oxlint": "1.80.0",
     "typescript": "7.0.2"
   }
 }
