@@ -16,12 +16,14 @@
  */
 
 import {
+	getDeclaredTools,
+	normalizeContext,
 	openAIResponsesApi,
 	registerSessionResourceCleanup,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
-	type Context,
+	type TranscriptContext,
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
@@ -141,7 +143,7 @@ export interface StreamDeps {
  */
 export function streamOverWebSocket(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 	deps: StreamDeps,
 ): AssistantMessageEventStream {
@@ -230,7 +232,7 @@ class PayloadCaptured extends Error {}
  */
 async function responseItemsFor(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	message: AssistantMessage,
 	options: SimpleStreamOptions | undefined,
 ): Promise<unknown[] | undefined> {
@@ -238,7 +240,7 @@ async function responseItemsFor(
 	try {
 		const probe = responsesApi.streamSimple(
 			model,
-			{ messages: [message], tools: context.tools },
+			normalizeContext({ messages: [message], tools: getDeclaredTools(context.messages) }),
 			{
 				...options,
 				signal: undefined,

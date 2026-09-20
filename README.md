@@ -10,7 +10,7 @@ while retaining HTTP/SSE when an endpoint cannot use it. The core request and ev
 
 ## Install
 
-Requires pi and pi-ai 0.84.0 or newer.
+Requires pi and pi-ai 0.86.0 or newer.
 
 ```
 pi install git:github.com/angribot/pi-openai-websocket

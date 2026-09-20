@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import { normalizeContext, type Api, type AssistantMessage, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
 import { StickySseSessions } from "./session-fallback.ts";
@@ -99,9 +99,9 @@ const model: Model<Api> = {
 	maxTokens: 1_000,
 };
 
-const context: Context = {
+const context = normalizeContext({
 	messages: [{ role: "user", content: "hello", timestamp: 1 }],
-};
+});
 
 function streamDeps(
 	selectedModel: Model<Api> = model,
@@ -164,6 +164,70 @@ test("equivalent cached requests in one named session reuse a WebSocket", async 
 
 	assert.equal(FakeWebSocket.instances.length, 1);
 	assert.equal(deps.stats.connectionsReused, 1);
+});
+
+test("a transcript grammar tool call continues with only the tool result", async (t) => {
+	const toolCall = {
+		type: "custom_tool_call",
+		id: "ctc_1",
+		call_id: "call_1",
+		name: "command",
+		input: "echo hello",
+	};
+	useFakeWebSocket(t, {
+		turns: [
+			[
+				{ type: "response.output_item.added", output_index: 0, item: { ...toolCall, input: "" } },
+				{ type: "response.output_item.done", output_index: 0, item: toolCall },
+				{
+					type: "response.completed",
+					response: { id: "resp_grammar", status: "completed", output: [toolCall] },
+				},
+			],
+		],
+	});
+	const grammarModel: Model<Api> = { ...model, compat: { supportsOpenAIGrammarTools: true } };
+	const transcript = normalizeContext({
+		messages: context.messages,
+		tools: [
+			{
+				name: "command",
+				description: "Run a command",
+				parameters: {
+					type: "object",
+					properties: { input: { type: "string" } },
+					required: ["input"],
+				},
+				constrainedSampling: { type: "grammar", variants: { openai_regex: ".*" } },
+			},
+		],
+	});
+	const deps = streamDeps(grammarModel, "websocket-cached");
+	t.after(() => deps.pool.closeAll());
+	const options = { apiKey: "secret", transport: "websocket-cached" as const, sessionId: "grammar-session" };
+	const assistant = await streamOverWebSocket(grammarModel, transcript, options, deps).result();
+	assert.equal(assistant.stopReason, "toolUse", assistant.errorMessage ?? "expected a tool call");
+	// Let the asynchronous baseline capture finish, as it would while the tool runs.
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const next = normalizeContext({
+		messages: [
+			...transcript.messages,
+			assistant,
+			{
+				role: "toolResult",
+				toolCallId: "call_1|ctc_1",
+				toolName: "command",
+				content: [{ type: "text", text: "hello" }],
+				isError: false,
+				timestamp: 2,
+			},
+		],
+	});
+	assertStreamStoppedNormally(await streamOverWebSocket(grammarModel, next, options, deps).result());
+	assert.equal(FakeWebSocket.instances.length, 1);
+	const sent = JSON.parse(FakeWebSocket.instances[0]!.sent[1]!);
+	assert.equal(sent.previous_response_id, "resp_grammar");
+	assert.deepEqual(sent.input, [{ type: "custom_tool_call_output", call_id: "call_1", output: "hello" }]);
 });
 
 test("a credential change in one named session opens a new WebSocket", async (t) => {
