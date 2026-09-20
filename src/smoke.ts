@@ -5,6 +5,7 @@
  *   node src/smoke.ts [provider] [model-id]
  */
 
+import { normalizeContext } from "@earendil-works/pi-ai/compat";
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
 import { StickySseSessions } from "./session-fallback.ts";
@@ -17,7 +18,7 @@ const { model, apiKey, baseUrl } = loadTarget(providerName, process.argv[3]);
 const stats = createStats();
 const stream = streamOverWebSocket(
 	model,
-	{ messages: [{ role: "user", content: "Reply with exactly: pong", timestamp: Date.now() }] },
+	normalizeContext({ messages: [{ role: "user", content: "Reply with exactly: pong", timestamp: Date.now() }] }),
 	{ apiKey, transport: "websocket", websocketConnectTimeoutMs: 15_000 },
 	{
 		stats,

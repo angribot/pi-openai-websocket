@@ -9,7 +9,7 @@
  * whole risk, and it can only be confirmed against a live endpoint.
  */
 
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai/compat";
+import { normalizeContext, type AssistantMessage, type Message } from "@earendil-works/pi-ai/compat";
 import { streamOverWebSocket } from "../index.ts";
 import { SocketPool } from "./continuation.ts";
 import { StickySseSessions } from "./session-fallback.ts";
@@ -33,7 +33,7 @@ const sessionId = `smoke-${Date.now()}`;
 
 async function turn(messages: Message[], label: string): Promise<AssistantMessage> {
 	const before = { delta: stats.deltaRequests, reused: stats.connectionsReused };
-	const stream = streamOverWebSocket(model, { messages }, { apiKey, sessionId, transport: "websocket-cached" }, deps);
+	const stream = streamOverWebSocket(model, normalizeContext({ messages }), { apiKey, sessionId, transport: "websocket-cached" }, deps);
 
 	let text = "";
 	let final: AssistantMessage | undefined;
