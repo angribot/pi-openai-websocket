@@ -228,7 +228,14 @@ class PayloadCaptured extends Error {}
  *
  * pi-ai does not export the conversion, but it runs inside request construction, and
  * `onPayload` sees the finished body. Throwing from there stops the request before
- * any client call, so this costs one body build and no network.
+ * any client call, so each probe costs one body build and no network.
+ *
+ * The tools have to be part of the probe context so grammar tool calls convert to
+ * `custom_tool_call` items. Transports that declare tools inside the input (via
+ * `additional_tools` or tool search) then prefix the assistant output with those
+ * client-side declarations. A second probe with the same tools but no assistant
+ * message captures that prefix, which is removed: only the response's own items
+ * belong in the baseline.
  */
 async function responseItemsFor(
 	model: Model<Api>,
@@ -236,21 +243,35 @@ async function responseItemsFor(
 	message: AssistantMessage,
 	options: SimpleStreamOptions | undefined,
 ): Promise<unknown[] | undefined> {
+	const tools = getDeclaredTools(context.messages);
+	const [declarations, captured] = await Promise.all([
+		captureProbeInput(model, normalizeContext({ messages: [], tools }), options),
+		captureProbeInput(model, normalizeContext({ messages: [message], tools }), options),
+	]);
+	if (!declarations || !captured) return undefined;
+
+	const prefix = captured.slice(0, declarations.length);
+	if (JSON.stringify(prefix) !== JSON.stringify(declarations)) return undefined;
+	return captured.slice(declarations.length);
+}
+
+/** The input pi-ai builds for `context`, captured before the probe reaches the network. */
+async function captureProbeInput(
+	model: Model<Api>,
+	context: TranscriptContext,
+	options: SimpleStreamOptions | undefined,
+): Promise<unknown[] | undefined> {
 	let captured: unknown[] | undefined;
 	try {
-		const probe = responsesApi.streamSimple(
-			model,
-			normalizeContext({ messages: [message], tools: getDeclaredTools(context.messages) }),
-			{
-				...options,
-				signal: undefined,
-				onPayload: (payload: unknown) => {
-					const input = (payload as { input?: unknown }).input;
-					if (Array.isArray(input)) captured = input;
-					throw new PayloadCaptured();
-				},
+		const probe = responsesApi.streamSimple(model, context, {
+			...options,
+			signal: undefined,
+			onPayload: (payload: unknown) => {
+				const input = (payload as { input?: unknown }).input;
+				if (Array.isArray(input)) captured = input;
+				throw new PayloadCaptured();
 			},
-		);
+		});
 		await probe.result();
 	} catch {
 		// Without a trustworthy baseline the next request sends the full input.
