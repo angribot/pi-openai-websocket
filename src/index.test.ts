@@ -166,7 +166,10 @@ test("equivalent cached requests in one named session reuse a WebSocket", async 
 	assert.equal(deps.stats.connectionsReused, 1);
 });
 
-test("a transcript grammar tool call continues with only the tool result", async (t) => {
+async function assertGrammarContinuation(
+	t: TestContext,
+	compat: NonNullable<Model<Api>["compat"]>,
+): Promise<void> {
 	const toolCall = {
 		type: "custom_tool_call",
 		id: "ctc_1",
@@ -186,7 +189,7 @@ test("a transcript grammar tool call continues with only the tool result", async
 			],
 		],
 	});
-	const grammarModel: Model<Api> = { ...model, compat: { supportsOpenAIGrammarTools: true } };
+	const grammarModel: Model<Api> = { ...model, compat };
 	const transcript = normalizeContext({
 		messages: context.messages,
 		tools: [
@@ -228,6 +231,25 @@ test("a transcript grammar tool call continues with only the tool result", async
 	const sent = JSON.parse(FakeWebSocket.instances[0]!.sent[1]!);
 	assert.equal(sent.previous_response_id, "resp_grammar");
 	assert.deepEqual(sent.input, [{ type: "custom_tool_call_output", call_id: "call_1", output: "hello" }]);
+}
+
+test("a transcript grammar tool call continues with only the tool result", async (t) => {
+	await assertGrammarContinuation(t, { supportsOpenAIGrammarTools: true });
+});
+
+test("additional_tools declarations stay out of the grammar continuation baseline", async (t) => {
+	await assertGrammarContinuation(t, {
+		supportsOpenAIGrammarTools: true,
+		supportsMidConvoSystemMessages: true,
+		supportsAdditionalTools: true,
+	});
+});
+
+test("tool search declarations stay out of the grammar continuation baseline", async (t) => {
+	await assertGrammarContinuation(t, {
+		supportsOpenAIGrammarTools: true,
+		supportsToolSearch: true,
+	});
 });
 
 test("a credential change in one named session opens a new WebSocket", async (t) => {
